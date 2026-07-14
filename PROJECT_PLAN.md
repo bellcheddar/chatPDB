@@ -9,7 +9,8 @@ reasons about structures that already exist, their provenance, and how to query 
 with real tools.
 
 **Author:** Marc C. Deller, D.Phil. ([marcdeller.com](https://marcdeller.com))
-**Status:** Planning complete (2026-07-14). Repo scaffolded. Phase 0 (environment) not yet started.
+**Status:** Phase 0 (environment) complete (2026-07-14). Venv + full tool stack verified on a real
+PDB entry. Phase 1 (base model survey) not yet started.
 **Fine-tune stack:** MLX-LM on Apple Silicon (committed — same choice chem_sage validated over five
 rounds; see section 3).
 **Sibling project:** [chem_sage](https://github.com/bellcheddar/ChemSage) — a QLoRA-tuned chemistry
@@ -222,6 +223,33 @@ one model selected and recorded, before Phase 2 begins.
    parse it, assign secondary structure, render a quick image).
 
 **Exit test:** all four tools parse/process the same real structure without error.
+
+**Done (2026-07-14).** venv created with Homebrew Python 3.14.6, `--system-site-packages` (so the
+already brew-installed PyMOL module is importable without a separate pip install). `mkdssp` installed
+via `brew tap brewsci/bio && brew install brewsci/bio/dssp`. All of `requirements.txt` installs
+clean. Two environment issues hit and fixed, worth knowing about before recreating this venv
+elsewhere:
+- **Xcode Command Line Tools were broken** (libc++ headers stripped to ~11 files, missing `<cmath>`
+  etc.), which failed `prody`'s native build. Fixed with
+  `sudo rm -rf /Library/Developer/CommandLineTools && sudo softwareupdate -i "Command Line Tools for
+  Xcode 26.6-26.6"` (the GUI `xcode-select --install` path hung waiting for a click with no display
+  attached — the headless `softwareupdate -i` install is the reliable path on this machine).
+- **`KMP_DUPLICATE_LIB_OK=TRUE` is required** — torch and mlx each bundle their own `libomp.dylib`,
+  and importing both in one process aborts (`OMP: Error #15`) without it. Set as an `export` at the
+  bottom of `.venv/bin/activate` (gitignored, so re-add it if the venv is ever recreated).
+- **Bio.PDB's DSSP wrapper infers file type from the path's extension** — `PDBList.retrieve_pdb_file`
+  saves files as `pdbXXXX.ent`, which DSSP's file-type sniffing rejects. Copy/rename to a `.pdb`
+  extension before handing the path to `Bio.PDB.DSSP.DSSP()`.
+- Non-fatal: PyMOL prints a `ModuleNotFoundError: No module named 'chatmol'` on launch from this
+  venv — it's executing Marc's personal `~/.pymolrc.py`, which imports a module from an unrelated
+  project. Doesn't block loading/rendering, but will show up in every `tool_exec.py` PyMOL call's
+  stderr later; worth a `pymol.pymol_argv` no-startup-script flag when Phase 6 builds the shim.
+
+Verified end to end: `mlx_lm generate` produced text at ~74 tok/s on `Qwen2.5-7B-Instruct-4bit`
+(4.4GB peak memory). Fetched real entry `1CRN` and round-tripped it through all four tools: Biopython
+parsed it (1 chain, 46 residues, 327 atoms), gemmi parsed the same file independently and agreed,
+DSSP assigned secondary structure (19 helix, 4 strand, 3 3-10-helix, 3 turn, 6 bend, 11 coil
+residues), and PyMOL loaded it and rendered a cartoon PNG confirming the fold visually.
 
 ### Phase 1 — Base model survey (0.5–1 day)
 Run `scripts/survey_base_models.py` against the candidates in section 6. Pick one, record it in
