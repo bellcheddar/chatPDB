@@ -1,0 +1,32 @@
+# Data and models (never commit corpora, weights, or adapters)
+data/corpus/
+data/sft/*.jsonl
+adapters/
+fused_model/
+models/
+!models/*/README.md
+exports/
+*.gguf
+*.safetensors
+*.npz
+outputs/
+logs/
+!logs/*_train.log
+.chroma/
+*.lance/
+
+# W&B local run artifacts
+wandb/
+
+# Secrets
+.env
+.webui_secret_key
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store

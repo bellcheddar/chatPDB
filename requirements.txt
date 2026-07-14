@@ -1,0 +1,43 @@
+# chatPDB — Python dependencies
+# Install into a fresh venv (Python 3.11+) on Apple Silicon.
+
+# --- Fine-tune + serve: MLX-LM (Apple Silicon / Metal) ---
+mlx
+mlx-lm                      # mlx_lm.lora (train), mlx_lm.fuse (merge), mlx_lm.server (serve)
+
+# --- Core / shared ---
+transformers>=4.46          # tokenisers / HF model metadata
+pyyaml
+pandas
+numpy
+requests
+rcsb-api                    # maintained RCSB PDB Data/Search/GraphQL client
+
+# --- Structural biology tools (ground truth for tool-calling + eval) ---
+biopython                   # Bio.PDB: parse, superpose, DSSP wrapper
+gemmi                       # fast mmCIF/PDB/CCD parsing, symmetry
+biopandas                   # tabular PDB/mmCIF wrangling
+MDAnalysis                  # ensembles / NMR models
+prody                       # complementary structural analysis
+# PyMOL: install separately (conda-forge pymol-open-source, or licensed PyMOL) — not pip-installable cleanly
+
+# --- Chat CLI ---
+rich                        # console rendering (Markdown, panels, progress, themes)
+prompt_toolkit              # interactive input with history, arrow keys, bottom toolbar
+pyfiglet                    # ASCII art banner (optional — graceful fallback if missing)
+
+# --- RAG layer ---
+chromadb
+torch                       # required by sentence-transformers for embeddings
+sentence-transformers       # local embeddings
+pypdf                       # PDF corpus ingestion (validation report PDFs, papers)
+
+# --- Training observability ---
+wandb                       # train/val loss, tokens/sec, memory, LR — from round one
+
+# --- Evaluation / serving client ---
+tqdm
+psutil                      # process CPU / memory monitoring (eval/compare/eval_compare.py)
+
+# --- Hosted demo (Phase 9) ---
+gradio                      # HF Spaces ChatInterface
