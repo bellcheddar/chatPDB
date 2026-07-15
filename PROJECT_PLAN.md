@@ -9,8 +9,8 @@ reasons about structures that already exist, their provenance, and how to query 
 with real tools.
 
 **Author:** Marc C. Deller, D.Phil. ([marcdeller.com](https://marcdeller.com))
-**Status:** Phase 0 (environment) complete (2026-07-14). Venv + full tool stack verified on a real
-PDB entry. Phase 1 (base model survey) not yet started.
+**Status:** Phase 1 (base model survey) complete (2026-07-15). Base model selected:
+`mlx-community/Qwen3-32B-4bit`. Phase 2 (RAG pipeline) not yet started.
 **Fine-tune stack:** MLX-LM on Apple Silicon (committed — same choice chem_sage validated over five
 rounds; see section 3).
 **Sibling project:** [chem_sage](https://github.com/bellcheddar/ChemSage) — a QLoRA-tuned chemistry
@@ -92,9 +92,12 @@ rounds: fine-tuning uses **MLX-LM** (`mlx_lm.lora`), no discrete GPU, no VRAM wa
 | 32 GB | ~14B | a few hours |
 | 64 GB | ~32B | longer, but feasible |
 
-**Record:** Mac memory 64 GB. Base model: **to be determined by the Phase 1 survey** (section 6) —
-do not default to chem_sage's Qwen2.5-32B-Instruct-4bit without benchmarking current alternatives
-first.
+**Record:** Mac memory 64 GB. Base model: **`mlx-community/Qwen3-32B-4bit`**, selected via the
+Phase 1 survey (section 6) over chem_sage's Qwen2.5-32B-Instruct-4bit baseline, DeepSeek-R1-Distill-
+Qwen-32B-4bit, and gemma-4-31b-it-4bit — best transcript accuracy/completeness of the four, at the
+cost of roughly a third the token-generation speed of the Qwen2.5 baseline. Thinking mode must be
+disabled at inference time (`chat_template_kwargs: {"enable_thinking": false}` on the OpenAI-
+compatible endpoint) or it burns its token budget on `<think>` and never reaches an answer.
 
 ---
 
@@ -200,17 +203,46 @@ Marc's explicit call: do not default to chem_sage's Qwen2.5-32B-Instruct-4bit. B
 format-literacy Q&A, general instruction-following — against each candidate served via
 `mlx_lm.server`, recording tok/s, peak RSS, and a qualitative pass/fail per prompt.
 
-Candidates as of the current (July 2026) landscape:
+Candidates, verified live on Hugging Face via the hub API (2026-07-14):
 
 | Model | Class | Notes |
 |---|---|---|
-| `mlx-community/Qwen3-32B-4bit` | dense, newer generation | Confirmed live on mlx-community. Same architecture family/config shape chem_sage already validated for MLX-LM LoRA. Leading candidate. |
-| `mlx-community/Qwen2.5-32B-Instruct-4bit` | dense | chem_sage's proven baseline — zero unknowns on this exact Mac. Serves as the survey's control/floor. |
-| `DeepSeek-R1-Distill-Qwen-32B` (4-bit MLX build) | dense, reasoning-distilled | Worth testing specifically for method-interpretation/QC reasoning tasks. |
-| Dense Gemma 4 31B (4-bit MLX, if mirrored) | dense | Only include if an mlx-community 4-bit build actually exists at survey time — verify before adding to the run. |
+| `mlx-community/Qwen3-32B-4bit` | dense, newer generation | Apache 2.0, 14.4K downloads. Same architecture family/config shape chem_sage already validated for MLX-LM LoRA. Leading candidate. |
+| `mlx-community/Qwen2.5-32B-Instruct-4bit` | dense | Apache 2.0, 295K downloads. chem_sage's proven baseline — zero unknowns on this exact Mac. Serves as the survey's control/floor. |
+| `mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit` | dense, reasoning-distilled | 7.4K downloads. Worth testing specifically for method-interpretation/QC reasoning tasks. |
+| `mlx-community/gemma-4-31b-it-4bit` | dense | Apache 2.0 (Gemma licence terms apply), 38.7K downloads. Natively multimodal (image-text-to-text) but usable text-only; only pure-text prompts used in this survey. |
 
 **Exit test:** a short written comparison appended to this document (§ survey results, to be added),
 one model selected and recorded, before Phase 2 begins.
+
+### Survey results (run 2026-07-15)
+
+All four candidates run to completion (8 prompts each, `config/system_prompt.txt` as system
+message, temperature 0.15). Raw transcripts: `eval/survey/results/survey_20260714_200040.md`
+(Qwen2.5), `survey_20260715_005930.md` (DeepSeek-R1-Distill, gemma4), `survey_20260715_012739.md`
+(Qwen3). Full JSON alongside each.
+
+| Model | Avg tok/s | Truncated (finish=length) | Automated checks | Notable |
+|---|---|---|---|---|
+| Qwen3-32B-4bit (thinking off) | 4.3 | 0/8 | 4/4 | Best accuracy and completeness of the four; correctly self-identified as chatPDB; clean, well-organised refusal on the out-of-scope prediction prompt. Markedly slower generation. |
+| Qwen2.5-32B-Instruct-4bit | ~12 (11.0–14.4) | 2/8 | 4/4 | Fast, accurate, chem_sage's proven baseline on this exact hardware/software stack. Ran at the original 500-token budget (raised to 800 for the other three after this run, to give reasoning models room) — its two truncations are a budget artifact, not a distinct weakness. |
+| DeepSeek-R1-Distill-Qwen-32B-4bit | ~13.6 | 5/8 | 4/4 | Fast but verbose, truncating most non-code answers even at 800 tokens. Mischaracterised a 2.8 Å structure as "high-resolution" (Qwen2.5 and Qwen3 both correctly called it moderate/medium) — a real domain-convention slip, notable given chatPDB's hard rule against unverified structural claims. |
+| gemma-4-31b-it-4bit | ~6.2, highly variable (0.6–11.0) | 5/8 | 4/4 | Sharp, specific detail when it completed (e.g. exact legacy-PDB atom/chain limits), but unstable generation speed and heavy truncation. Gemma licence (not pure Apache 2.0) and natively-multimodal overhead unused in a text-only deployment are additional minor costs. |
+
+**Reading:** the automated checks (code-block presence, SIFTS/UniProt/Pfam mention, refusal-phrase
+detection) are floor-level competence and all four pass them — they don't discriminate. The real
+signal is in the transcripts: Qwen3 is the clear quality leader (complete, accurate, well-calibrated
+on structural-QC judgement calls like the resolution question) but roughly a third the speed of the
+others; Qwen2.5 is the fast, zero-operational-risk incumbent; DeepSeek-R1-Distill and gemma4 both
+struggled with truncation at equal or greater token budgets and gemma4's speed was additionally
+unpredictable, making them harder to recommend for an interactive local CLI regardless of raw tok/s.
+
+**Decision (2026-07-15): `mlx-community/Qwen3-32B-4bit`.** Marc's call, choosing transcript quality
+over raw speed. The slower generation is a known, accepted tradeoff going into Phase 2 onward —
+worth remembering when tuning `max_tokens`/timeouts in the CLI (Phase 8) and when estimating
+wall-clock time for the eval harness (Phase 7) and the fine-tune itself (Phase 4). Thinking mode
+must stay disabled at inference (see section 3) except where a future round deliberately wants to
+test reasoning-mode behaviour on QC/judgement-call prompts.
 
 ---
 

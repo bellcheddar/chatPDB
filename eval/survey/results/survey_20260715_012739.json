@@ -1,0 +1,118 @@
+[
+  {
+    "candidate": {
+      "id": "qwen3",
+      "hf_repo": "mlx-community/Qwen3-32B-4bit",
+      "label": "Qwen3-32B-4bit",
+      "class": "dense, newer generation",
+      "extra_body": {
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        }
+      }
+    },
+    "prompts": [
+      {
+        "id": "tool_biopython",
+        "category": "tool_calling",
+        "prompt": "Write Python code using Biopython to load a PDB file called 'structure.pdb', then print the number of chains and the total atom count.",
+        "elapsed_s": 32.2,
+        "tokens_per_sec": 6.3,
+        "finish_reason": "stop",
+        "truncated_mid_thinking": false,
+        "check": "has_code_block_with",
+        "check_pass": true,
+        "content": "Here's Python code using Biopython to load a PDB file called `'structure.pdb'`, count the chains, and calculate the total atom count:\n\n```python\nfrom Bio.PDB import PDBParser\n\n# Initialize parser\nparser = PDBParser()\n\n# Load structure from file\nstructure = parser.get_structure('structure', 'structure.pdb')\n\n# Count chains\nchain_count = len(list(structure.get_chains()))\n\n# Count atoms\natom_count = sum(1 for atom in structure.get_atoms())\n\n# Print results\nprint(f\"Number of chains: {chain_count}\")\nprint(f\"Total atom count: {atom_count}\")\n```\n\nThis script uses Biopython's `PDBParser` class to load the structure file `'structure.pdb'`. It counts chains using `get_chains()` and atoms using `get_atoms()`. The results are printed at the end.\n\nMake sure Biopython is installed (`pip install biopython`) before running the script."
+      },
+      {
+        "id": "tool_gemmi",
+        "category": "tool_calling",
+        "prompt": "Write Python code using gemmi to read an mmCIF file called 'structure.cif' and print its resolution and space group.",
+        "elapsed_s": 24.6,
+        "tokens_per_sec": 6.7,
+        "finish_reason": "stop",
+        "truncated_mid_thinking": false,
+        "check": "has_code_block_with",
+        "check_pass": true,
+        "content": "Here's Python code using `gemmi` to read an mmCIF file called `'structure.cif'` and print its resolution and space group:\n\n```python\nimport gemmi\n\n# Load the mmCIF file\nstructure = gemmi.read_structure('structure.cif')\n\n# Get resolution from the structure\nresolution = structure.resolution\n\n# Get space group information\nspace_group = structure.space_group\n\n# Print results\nprint(f\"Resolution: {resolution:.2f} \u00c5\")\nprint(f\"Space Group: {space_group}\")\n```\n\nThis script reads the structure file `'structure.cif'`, extracts the resolution (`structure.resolution`) and space group (`structure.space_group`), and prints them formatted appropriately.\n\nMake sure `gemmi` is installed (`pip install gemmi`) before running the script."
+      },
+      {
+        "id": "format_pdb_vs_mmcif",
+        "category": "file_format_literacy",
+        "prompt": "What is the difference between the legacy PDB format and mmCIF, and why did the wwPDB adopt mmCIF as the primary archival format?",
+        "elapsed_s": 454.2,
+        "tokens_per_sec": 1.2,
+        "finish_reason": "stop",
+        "truncated_mid_thinking": false,
+        "check": null,
+        "check_pass": null,
+        "content": "The legacy Protein Data Bank (PDB) format and the macromolecular Crystallographic Information File (mmCIF) format differ fundamentally in structure, flexibility, and capacity for representing structural data.\n\n### Legacy PDB Format:\n- **Fixed-column format**: Each piece of information occupies predefined columns, limiting flexibility.\n- **Line-based records**: Data are stored in fixed-length lines with specific keywords like `ATOM`, `HETATM`, `HELIX`, etc.\n- **Limited metadata**: Metadata such as experimental details, validation metrics, ligand annotations, and biological assemblies are sparse or absent.\n- **Hardcoded assumptions**: The format assumes certain conventions (e.g., residue numbering schemes), making it less adaptable to diverse experimental methods like cryo-EM or NMR ensembles.\n- **Scalability issues**: The format struggles with large datasets, such as those arising from cryo-EM structures with thousands of atoms.\n\n### mmCIF Format:\n- **Structured data model**: mmCIF uses a tabular format inspired by the Crystallographic Information File (CIF), allowing hierarchical relationships between data items.\n- **Extensible schema**: New data categories can be added without breaking compatibility, accommodating advances like cryo-EM density maps, NMR ensembles, and integrative modeling.\n- **Rich metadata**: mmCIF supports comprehensive metadata including experimental details, validation reports, ligand stereochemistry, and biological assembly definitions.\n- **Self-descriptive**: Each data item includes metadata describing its meaning and units.\n- **Machine-readable**: Easier parsing and integration into computational workflows compared to fixed-column formats.\n\n### Why wwPDB Adopted mmCIF:\nThe wwPDB adopted mmCIF as the primary archival format beginning in January 2023 due to several critical factors:\n1. **Experimental diversity**: The legacy PDB format lacked capacity to represent data from newer methods like cryo-EM and integrative modeling adequately.\n2. **Metadata richness**: mmCIF supports detailed metadata essential for reproducibility and downstream analysis.\n3. **Validation integration**: The wwPDB validation reports are naturally integrated into mmCIF files.\n4. **Future-proofing**: mmCIF\u2019s extensibility ensures compatibility with evolving structural biology technologies.\n5. **Community alignment**: The structural biology community increasingly relies on mmCIF-compatible tools and databases like PDBe, RCSB, and BMRB.\n\nThe legacy PDB format remains available for backward compatibility but is no longer the primary archival format. For example, querying PDBe or RCSB for structures deposited post-2023 typically returns mmCIF files by default.\n\nFor more details, consult the wwPDB documentation at https://www.wwpdb.org."
+      },
+      {
+        "id": "format_records",
+        "category": "file_format_literacy",
+        "prompt": "In a PDB file, what do the ATOM and HETATM record types represent, and what information is stored under REMARK 350?",
+        "elapsed_s": 208.1,
+        "tokens_per_sec": 2.8,
+        "finish_reason": "stop",
+        "truncated_mid_thinking": false,
+        "check": null,
+        "check_pass": null,
+        "content": "In a Protein Data Bank (PDB) file:\n\n### **ATOM Records**\nThese records describe the coordinates of atoms belonging to standard amino acid residues and nucleic acid residues found in proteins and nucleic acids. Each ATOM record typically includes:\n- Atom serial number\n- Atom name\n- Residue name\n- Chain identifier\n- Residue sequence number\n- Coordinates (x, y, z)\n- Occupancy\n- Temperature factor (B-factor)\n- Element symbol\n- Charge\n\nExample line:\n```\nATOM   1234  CA  ALA A  10      12.345  23.456  34.567  1.00 20.00           C\n```\n\n### **HETATM Records**\nThese records describe atoms belonging to heterogens \u2014 atoms not part of standard amino acid residues or nucleic acids \u2014 such as ligands, cofactors, ions, water molecules (`HOH`), or other non-polymer molecules bound to the macromolecule. The format is identical to ATOM records, differing only semantically.\n\nExample line:\n```\nHETATM 2345  O   HOH X  200     15.678  26.789  37.890  1.00 22.00           O\n```\n\n---\n\n### **REMARK 350**\nREMARK records provide supplementary information about the structure deposition and assembly details. REMARK 350 specifically describes the biological assembly information derived from the asymmetric unit coordinates.\n\nIt typically includes:\n- The number of biological assemblies identified (`BIOMOLECULE: n`)\n- For each assembly:\n  - Symmetry transformations required to generate the biological assembly from asymmetric unit chains\n  - Chain identifiers involved\n  - Symmetry operators used (`OPERATION: ...`)\n- Notes about assembly generation algorithms used (`Generated by PISA`)\n\nExample snippet:\n```\nREMARK 350 BIOMOLECULE: 1\nREMARK 350 AUTHOR DETERMINED BIOLOGICAL UNIT: DIMERIC\nREMARK 350 APPLY THE FOLLOWING TO CHAINS: A,B\nREMARK 350 BIOMOLECULE: 2\nREMARK 350 AUTHOR DETERMINED BIOLOGICAL UNIT: MONOMERIC\nREMARK 350 APPLY THE FOLLOWING TO CHAINS: C\n```\n\nThis helps researchers distinguish between asymmetric unit coordinates and biologically relevant assemblies derived from symmetry operations.\n\nLet me know if you'd like pseudocode or Biopython to extract REMARK 350 data programmatically."
+      },
+      {
+        "id": "method_resolution",
+        "category": "experimental_method",
+        "prompt": "A crystal structure was solved at 2.8 Angstrom resolution with an Rfree of 0.28. Is this a high-quality structure? Explain what resolution and Rfree tell you and what a structural biologist should be cautious about at this resolution.",
+        "elapsed_s": 253.5,
+        "tokens_per_sec": 3.0,
+        "finish_reason": "stop",
+        "truncated_mid_thinking": false,
+        "check": null,
+        "check_pass": null,
+        "content": "Resolution and Rfree are two key metrics used to assess the quality of crystallographic structures deposited in the Protein Data Bank (PDB). Let\u2019s unpack what they mean and evaluate the quality of this structure.\n\n### Resolution\nResolution refers to the smallest distance between atoms that can reliably be distinguished in the electron density map derived from crystallographic data. It is typically measured in Angstroms (\u00c5). Lower resolution values indicate higher quality data \u2014 meaning finer details can be resolved.\n\n- **At 2.8 \u00c5 resolution**, most backbone atoms can typically be resolved reliably, especially in well-ordered regions of the structure.\n- Side-chain positions may be less certain, particularly for residues with bulky side chains.\n- Hydrogen atoms are rarely resolved at resolutions above ~1.2 \u00c5, so they are omitted from structures solved at higher resolutions like 2.8 \u00c5.\n- Electron density maps at this resolution often appear somewhat \"fuzzy\" compared to higher-resolution structures (< 1.5 \u00c5).\n\n### Rfree\nRfree is a measure of how well the model fits experimental data that were excluded during refinement (\"free\" dataset). It reflects the accuracy of the atomic model relative to the observed diffraction data.\n\n- **An Rfree value of 0.28** suggests moderate quality refinement.\n- Typical ranges are:\n  - Excellent refinement: Rfree \u2248 0.18\u20130.22\n  - Good refinement: Rfree \u2248 0.22\u20130.25\n  - Acceptable refinement: Rfree \u2248 0.25\u20130.28\n  - Marginal refinement: Rfree \u2248 > 0.28\n\nSo an Rfree of **0.28** sits at the borderline between acceptable and marginal refinement quality.\n\n### Is This a High-Quality Structure?\n**No**, it is **not considered high-quality**, especially given modern standards where resolutions often reach sub-\u00c5 levels and Rfree values commonly fall below 0.22\u20130.23.\n\nHowever, it may still be scientifically useful \u2014 particularly if the biological question being addressed does not require atomic-level detail.\n\n### What Should Structural Biologists Be Cautious About at This Resolution?\nAt **2.8 \u00c5 resolution**, structural biologists should consider the following limitations:\n\n#### 1. **Uncertainty in Side Chains**\nSide-chain conformations are often poorly resolved at resolutions above ~2 \u00c5. This affects ligand binding-site modeling and interpretation of interactions involving side chains.\n\n#### 2. **Limited Hydrogen Atom Information**\nHydrogen atoms are typically omitted from models solved at resolutions above ~1.2 \u00c5 due to insufficient electron density.\n\n#### 3. **Potential for Model Overfitting**\nAn Rfree of 0.28 suggests refinement may rely heavily on manual intervention or assumptions rather than robust data fitting.\n\n#### 4. **Electron Density Quality**\nThe electron density maps are likely less sharp than those derived from higher-resolution data, increasing uncertainty about backbone trace accuracy.\n\n#### 5. **Functional Interpretation Limitations**\nInterpretations involving hydrogen bonding networks, protonation states, or solvent-mediated interactions are speculative without higher-resolution data.\n\n### Summary\n- Resolution: **2.8 \u00c5** \u2014 moderate quality data.\n- Rfree: **0.28** \u2014 borderline acceptable refinement quality.\n- **Conclusion**: The structure is usable but **not high-quality** by modern standards. Structural biologists should treat side-chain positions, ligand interactions, and functional interpretations with caution unless supported by biochemical evidence.\n\nIf you\u2019d like, I can show Biopython code to extract resolution and Rfree values from a specific PDB file."
+      },
+      {
+        "id": "method_assembly",
+        "category": "experimental_method",
+        "prompt": "Explain the difference between the biological assembly and the asymmetric unit in a PDB entry, and why they can differ.",
+        "elapsed_s": 558.2,
+        "tokens_per_sec": 1.3,
+        "finish_reason": "stop",
+        "truncated_mid_thinking": false,
+        "check": null,
+        "check_pass": null,
+        "content": "The asymmetric unit and biological assembly are two distinct concepts encountered when working with structures deposited in the Protein Data Bank (PDB):\n\n### **Asymmetric Unit**\nThe asymmetric unit refers to the smallest repeating unit of the crystal structure that contains all the unique atoms required to build the entire crystal lattice via symmetry operations defined by the crystallographic space group.\n\n- It is the actual structure solved experimentally and deposited into the PDB file (`*.pdb`, `*.cif`, etc.).\n- It may contain fewer molecules than are present in the biologically functional complex.\n- The asymmetric unit reflects the symmetry constraints imposed during crystallization\u2014not biological function.\n\nExample:\nIf a protein forms a tetramer in solution but crystallizes with symmetry constraints that allow only two molecules per asymmetric unit, the asymmetric unit will contain two molecules rather than four.\n\n### **Biological Assembly**\nThe biological assembly refers to the arrangement of molecules that corresponds to the functional form of the protein in vivo\u2014typically the oligomeric state observed physiologically.\n\n- Biological assemblies are often generated computationally from the asymmetric unit using symmetry operations derived from the crystallographic data (`pdbsum`, `PISA`, `PyMOL`, `BioPython`, etc.).\n- The biological assembly reflects biological relevance rather than crystal symmetry constraints.\n\nExample:\nIf the asymmetric unit contains two monomers and the biological assembly requires four monomers arranged tetramerically, computational symmetry operations are applied to generate the tetramer from the asymmetric unit data.\n\n### Why They Can Differ\nThe asymmetric unit and biological assembly differ primarily due to crystal symmetry constraints during crystallization experiments:\n\n- **Crystal symmetry**: The crystal lattice imposes symmetry constraints that may reduce the number of molecules visible in the asymmetric unit compared to the biological assembly.\n- **Experimental limitations**: The crystal structure may capture only part of the functional complex due to packing artifacts or disorder.\n- **Biological relevance**: The biological assembly reflects functional interactions observed physiologically rather than crystallographic symmetry.\n\n### Example Calculation\nTo illustrate the difference between asymmetric unit content and biological assembly content using Biopython:\n\n```python\nfrom Bio.PDB import PDBParser\n\n# Parse asymmetric unit structure\nparser = PDBParser()\nstructure = parser.get_structure(\"example\", \"example.pdb\")\n\n# Count chains in asymmetric unit\nasym_chains = len(structure[0].get_chains())\nprint(f\"Number of chains in asymmetric unit: {asym_chains}\")\n```\n\nTo generate biological assemblies programmatically using Biopython:\n\n```python\nfrom Bio.PDB import PDBList, PDBParser, MMCIFParser\n\n# Download biological assembly file\npdb_id = \"example\"\npdbl = PDBList()\npdbl.retrieve_pdb_file(pdb_id)\n\n# Parse biological assembly file (.pdb or .cif)\nparser = PDBParser() if pdb_id.endswith(\".pdb\") else MMCIFParser()\nassembly_structure = parser.get_structure(pdb_id, f\"{pdb_id}.pdb\")\n\n# Count chains in biological assembly\nassembly_chains = len(assembly_structure[0].get_chains())\nprint(f\"Number of chains in biological assembly: {assembly_chains}\")\n```\n\nThis highlights how computational tools can distinguish between asymmetric units and biological assemblies programmatically.\n\nFor more details, consult the [PDB documentation](https://www.rcsb.org/3d-view/assembly) or tools like [PISA](https://www.ebi.ac.uk/thornton-srv/databases/3D-PISA/)."
+      },
+      {
+        "id": "crossref_sifts",
+        "category": "database_cross_referencing",
+        "prompt": "Given a PDB entry and a specific chain, how would you find the corresponding UniProt accession and Pfam domain annotations for that chain? Name the actual database/resource you would use.",
+        "elapsed_s": 88.0,
+        "tokens_per_sec": 5.5,
+        "finish_reason": "stop",
+        "truncated_mid_thinking": false,
+        "check": "mentions_any",
+        "check_pass": true,
+        "content": "To find the corresponding UniProt accession and Pfam domain annotations for a specific chain in a PDB entry, you would use the **SIFTS** database via the Protein Data Bank (PDB) or PDBe (Protein Data Bank in Europe).\n\n### Step-by-step approach:\n\n#### 1. **Obtain UniProt Accession**\nUse the **SIFTS mapping data** provided by PDBe or RCSB PDB to map residues in the chain to their corresponding UniProt entries.\n\nExample using PDBe REST API (`https://www.ebi.ac.uk/pdbe/api`):\n\n```bash\ncurl \"https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/PDB_ID/CHAIN_ID\"\n```\n\nReplace `PDB_ID` with the actual PDB identifier and `CHAIN_ID` with the chain identifier.\n\n#### 2. **Obtain Pfam Domain Annotations**\nUse the **SIFTS Pfam mapping** data via PDBe REST API:\n\n```bash\ncurl \"https://www.ebi.ac.uk/pdbe/api/mappings/pfam/PDB_ID/CHAIN_ID\"\n```\n\nThis returns Pfam domain annotations mapped onto residues of the specified chain.\n\n---\n\n### Example using Python (`requests` library):\n\n```python\nimport requests\n\npdb_id = \"1TIM\"\nchain_id = \"A\"\n\n# Get UniProt mapping\nuniprot_url = f\"https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/{pdb_id}/{chain_id}\"\nuniprot_response = requests.get(uniprot_url).json()\n\n# Get Pfam mapping\npfam_url = f\"https://www.ebi.ac.uk/pdbe/api/mappings/pfam/{pdb_id}/{chain_id}\"\npfam_response = requests.get(pfam_url).json()\n\nprint(\"UniProt Accessions:\", uniprot_response)\nprint(\"Pfam Domains:\", pfam_response)\n```\n\n---\n\n### Notes:\n- **SIFTS** provides residue-level mappings between PDB chains and UniProt/Pfam entries.\n- For Pfam annotations, ensure the chain has been annotated \u2014 some chains may lack Pfam mappings.\n- For more detailed Pfam domain boundaries, consult Pfam directly (`https://pfam.xfam.org/`) using the returned domain IDs.\n\nLet me know if you\u2019d like an example with a specific PDB ID and chain!"
+      },
+      {
+        "id": "refusal_prediction",
+        "category": "refusal_boundary",
+        "prompt": "Predict the 3D structure of this protein sequence and give me the atomic coordinates: MKTAYIAKQRQISFVKSHFSRQLEERLGLIEVQAPILSRVGDGTQDNLSGAEKAVQVKVKALPDAQFEVVHSLAKWKRQTLGQHDFSAGEGLYTHMKALRPDEDRLSPLHSVYVDQWDWELVMGDGERQFSTLKSTVEAIWAGIKATEAAVSEEFGLAPFLPDQIHFVHSQELLSRYPDLDAKGRERAIAKDLGAVFLVGIGGKLSDGHRHDVRAPDYDDWSTPSELGHAGLNGDILVWNPVLEDAFELSSMGIRVDADTLKHQLALTGDEDRLELEWHQALLRGEMPQTIGGGIGQSRLTMLLLQLPHIGQVQAGVWPAAVRESVPSLL",
+        "elapsed_s": 37.2,
+        "tokens_per_sec": 7.8,
+        "finish_reason": "stop",
+        "truncated_mid_thinking": false,
+        "check": "declines_prediction",
+        "check_pass": true,
+        "content": "Structural prediction of novel sequences falls outside experimental databases like the Protein Data Bank (PDB) and is beyond the scope of chatPDB\u2019s capabilities. However, I can guide you toward tools suitable for this task:\n\n1. **AlphaFold2** (via the [AlphaFold DB](https://www.alphafold.com/)): Predicts high-quality structures using deep learning trained on experimental structures.\n   - Submit your sequence via the AlphaFold DB interface or run locally using the [ColabFold notebook](https://colabfold.readthedocs.io/en/latest/).\n   - Output includes atomic coordinates in PDB format.\n\n2. **RoseTTAFold** ([RoseTTAFold GitHub](https://github.com/rob-kearnes/rosettafold)): Another deep-learning-based predictor with similar capabilities.\n\n3. **I-TASSER**: Predicts structures via threading and ab initio modeling ([I-TASSER website](https://zhanggroup.org/I-TASSER/)).\n\nFor coordinate visualization and analysis post-prediction:\n- Use **PyMOL**, **ChimeraX**, or **Jupyter notebooks** with Biopython/gemmi for structural inspection.\n- For ligand docking or binding-site analysis, tools like **AutoDock** or **HADDOCK** are suitable.\n\nWould you like guidance on submitting your sequence to AlphaFold DB or running ColabFold?"
+      }
+    ],
+    "error": null,
+    "resources": {
+      "peak_rss_gb": 17.85,
+      "mean_cpu_pct": 33.3
+    }
+  }
+]
