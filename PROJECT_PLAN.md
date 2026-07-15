@@ -9,8 +9,9 @@ reasons about structures that already exist, their provenance, and how to query 
 with real tools.
 
 **Author:** Marc C. Deller, D.Phil. ([marcdeller.com](https://marcdeller.com))
-**Status:** Phase 1 (base model survey) complete (2026-07-15). Base model selected:
-`mlx-community/Qwen3-32B-4bit`. Phase 2 (RAG pipeline) not yet started.
+**Status:** Phase 2 (RAG pipeline) complete (2026-07-15). Base model: `mlx-community/Qwen3-32B-4bit`.
+RCSB/SIFTS corpus ingested (27,484 chunks), retrieval + deterministic exact-ID lookup both verified
+against the live model. Phase 3 (SFT dataset) not yet started.
 **Fine-tune stack:** MLX-LM on Apple Silicon (committed — same choice chem_sage validated over five
 rounds; see section 3).
 **Sibling project:** [chem_sage](https://github.com/bellcheddar/ChemSage) — a QLoRA-tuned chemistry
@@ -298,6 +299,62 @@ immediately and is reversible.
 
 **Exit test:** ask a question only the corpus can answer, get a grounded answer with the source
 chunk shown.
+
+**Done (2026-07-15).** `scripts/download_rcsb.py` pulls four sources into `data/corpus/rcsb/`
+(1.1 GB total, gitignored, regenerate with the script):
+- `pdb_all_entries.csv` / `pdb_entries_enriched.csv` — 256,448 entries each, the second GraphQL-
+  enriched with method/resolution/R-free/R-work/EM-resolution/entity counts (verified live against
+  the RCSB schema before writing the query — `refine` and `em_3d_reconstruction` resolve correctly;
+  `pdbx_vrpt_summary` does not expose clashscore/Rama-outliers at entry level, confirmed by
+  introspection, so those stay a separate future "wwPDB validation reports" source per section 4).
+- `pdb_ccd_full.csv` — the full 53,417-entry Chemical Component Dictionary, parsed directly from
+  wwPDB's bulk `components.cif.gz` with **gemmi** (all ~50k blocks in 3.6s) rather than enumerating
+  IDs from an index file and round-tripping each through GraphQL — the index file this repo's first
+  draft relied on (`cc-counts.tdd`) has been retired, and the RCSB Search API fallback's query shape
+  had also gone stale. Parsing the authoritative bulk CIF sidesteps both problems and is more
+  reliable regardless.
+- Seven SIFTS cross-reference files (UniProt, Pfam, CATH, SCOP2, EC/enzyme, GO, InterPro) — the
+  combined `pdb_chain_cath_scop.csv.gz` chem_sage's downloader used has also been retired by EBI in
+  favour of separate files; verified the live directory listing before wiring up filenames. GO and
+  InterPro are enormous (16.3M and 4.3M rows) — `ingest_rag.py` samples both down to 150k rows
+  before chunking (see below) rather than let chunk sizes balloon.
+
+**Bug caught and fixed during this pass:** the entries-index parser silently produced misaligned
+columns — wwPDB has changed `entries.idx`'s layout since chem_sage's `download_pdb.py` was written
+against it (now `IDCODE, HEADER, ACCESSION DATE, COMPOUND, SOURCE, AUTHOR LIST, RESOLUTION,
+EXPERIMENT TYPE`, ported code assumed a different, older 8th-column layout). Caught by cross-
+checking a known entry (102M) against the independently-sourced `pdb_entries_enriched.csv` and
+finding the title/organism/date fields in the wrong columns. Fixed by reading the live file's header
+row directly rather than trusting the inherited assumption — a reminder that every ported chem_sage
+data-fetching pattern needs its column/field assumptions re-verified live, not just its code reused.
+
+`scripts/ingest_rag.py` and `rag/retrieve.py` are ported near-verbatim from chem_sage (same
+chunking/embedding/Chroma pattern). One real scaling gap found and fixed: chem_sage's
+`MAX_CHUNKS_PER_CSV` cap-driven chunking assumes files up to ~1M rows; at 16.3M rows,
+`sifts_pdb_go.csv` under the existing cap would have produced ~192,000-character chunks (far past
+what a 512-token embedder encodes). Added `MAX_ROWS_PER_CSV`, an even-stride sample applied before
+chunking for the two outsized files (GO, InterPro capped to 150k rows each) — a representative
+sample, not full coverage, which is an accepted tradeoff since exact lookups on this kind of
+low-diversity relational data belong in `rag/corpus_lookup.py`, not semantic search, anyway.
+
+**Finding that shaped the architecture:** dense embedding search over chunks that each concatenate
+dozens to hundreds of table rows is good at finding topically-similar chunks but bad at pinpointing
+one exact row inside a chunk — confirmed empirically: "what R-free was 102M solved at" retrieved
+chunks *about* resolution/R-free generally, not specifically the chunk containing row 102M. This is
+exactly the limitation chem_sage's `rag/corpus_lookup.py` exists to solve, so chatPDB built the same
+component: `rag/corpus_lookup.py` extracts PDB IDs / CCD comp IDs from a query via regex (with a
+stopword guard — "PDB" itself is coincidentally also a real, irrelevant CCD code) and looks them up
+directly with pandas across eight registered corpus files, bypassing embeddings entirely for exact
+identifier questions. The two huge SIFTS files (GO, InterPro) are deliberately excluded from this
+registry (full-file pandas loads would be slow for a single lookup) and remain semantic-search-only
+for now.
+
+**Verified end to end:** `corpus_lookup.lookup("102M")` returns exact, correct rows from all eight
+registered files (resolution 1.84 Å, R-free 0.203, R-work 0.159, UniProt P02185, Pfam PF00042, CATH
+102mA00, EC 1.11.1.-/1.7.-.-). Fed as grounding context into a live `mlx_lm.server` running
+Qwen3-32B-4bit (thinking disabled), the model correctly answered "resolution of 1.84 Å... R-free
+value of 0.203... Chain A... maps to the UniProt accession P02185" and cited the corpus context —
+the actual grounded-answer loop, not just retrieval in isolation.
 
 ### Phase 3 — SFT dataset (the real work, 3–5 days)
 All four behaviour classes weighted equally (Marc's call):
