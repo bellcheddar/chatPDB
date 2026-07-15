@@ -9,11 +9,10 @@ reasons about structures that already exist, their provenance, and how to query 
 with real tools.
 
 **Author:** Marc C. Deller, D.Phil. ([marcdeller.com](https://marcdeller.com))
-**Status:** Phase 2 (RAG pipeline) complete (2026-07-15), corpus expansion round complete
-(2026-07-16). Base model: `mlx-community/Qwen3-32B-4bit`. Corpus: 18 files / 65,811 RAG chunks
-(RCSB, SIFTS, CATH, InterPro, Pharos, TWILIGHT, UniProtKB/Swiss-Prot). Retrieval + deterministic
-exact-ID lookup (11 registered files, one two-hop join) both verified against the live model.
-Phase 3 (SFT dataset) not yet started.
+**Status:** Phase 3 (SFT dataset) complete (2026-07-16). Base model: `mlx-community/Qwen3-32B-4bit`.
+RAG corpus: 18 files / 65,811 chunks. SFT dataset v1: 45,502 examples (36,402 train / 4,550 valid /
+4,550 test) — more than double chem_sage's largest round (20,000, R5), generated in one pass.
+Phase 4 (QLoRA fine-tune) not yet started.
 **Fine-tune stack:** MLX-LM on Apple Silicon (committed — same choice chem_sage validated over five
 rounds; see section 3).
 **Sibling project:** [chem_sage](https://github.com/bellcheddar/ChemSage) — a QLoRA-tuned chemistry
@@ -477,6 +476,45 @@ a frozen `test.jsonl`, chat format (`{"messages": [...]}`) matching chem_sage's 
 
 **Exit test:** every assistant code block runs; every PDB/UniProt ID referenced resolves to a real
 entry; a spot-read of 20 examples reads like something Marc would have written.
+
+**Done (2026-07-16).** Marc's brief: aim for as many examples as possible, target 50,000, to beat
+chem_sage's largest round (20,000, R5). Landed at **45,502** (36,402 train / 4,550 valid / 4,550
+test) — short of 50,000 honestly, not padded to hit the number (see below), still more than double
+chem_sage's R5.
+
+`scripts/build_dataset.py` uses two ground-truth tiers, both real:
+- **Metadata-grounded** (bulk, no download needed): ~20 generator functions across the four classes,
+  each sampling a real row from an already-ingested, already-verified corpus DataFrame (resolution,
+  R-free, UniProt function, CATH fold, EC number, Pharos TDL, TWILIGHT RSCC, CCD identity...) and
+  templating the Q/A around that real value. The PDB ID / accession / comp ID in every example is
+  read directly from the DataFrame, never a literal — there is no code path that could cite an ID
+  the corpus doesn't contain.
+- **Execution-verified** (`scripts/download_structure_pool.py`, 820 real structure files stratified
+  600 X-ray / 150 NMR / 100 EM, 50–4,000 atoms, capped for fast parsing): DSSP secondary-structure
+  assignment and NMR model counts are computed **live** against real downloaded coordinates — no
+  metadata shortcut exists for these, so unlike the templated tier they're hard-capped by pool size
+  (820 files), not by target count. This is why `tool_calling` landed at 8,010 instead of ~12,500:
+  its three metadata-grounded generators (Biopython atom/chain counts, gemmi resolution/method,
+  PyMOL scripts) scale to 256k entries, but the two execution-verified ones can't exceed the pool.
+  **This is the honest reason the 50,000 target wasn't hit** — the alternative (duplicate pool files
+  with reworded questions, or fabricate DSSP output) would have violated "never hand-author a
+  number," so the shortfall was accepted rather than the rule bent.
+
+**A real bug caught and fixed during this pass:** `mkdssp` 4.6.1 has a genuine bug in its internal
+legacy-PDB→mmCIF conversion — it raised `Duplicate Key violation` on modern REMARK 3
+refinement-statistics blocks (multiple TLS groups etc.), failing on roughly 40% of the structure
+pool's post-2015 X-ray entries (confirmed via direct `mkdssp` CLI testing, not just the Biopython
+wrapper). Root-caused and fixed by converting each file to mmCIF with **gemmi** first (a converter
+that doesn't hit the bug) and running `mkdssp` against that instead — `_run_dssp()` in
+`build_dataset.py`. Recorded in the DSSP generator's own examples too (a 15% chance of an added
+note about the gemmi-conversion fallback), so the model learns the real-world caveat, not just the
+textbook-clean code path.
+
+Class balance and token-length stats (Qwen3-32B-4bit tokenizer, p50=549, p99=816, max=1,549 — all
+comfortable under any `max_seq_length` chem_sage used) are in `data/README.md`. 20-example spot-read
+done manually; every example read as something Marc would have written, no fabricated numbers, no
+hedge-text template leaks (one found and fixed — a literal "if applicable" leaking into prose
+regardless of whether the value was actually present).
 
 ### Phase 4 — QLoRA fine-tune with MLX-LM (0.5–1 day of compute)
 `config/train_config.yaml` seeded from chem_sage's validated field names and values (rank, RSLoRA,

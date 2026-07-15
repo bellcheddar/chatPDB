@@ -62,7 +62,7 @@ REGISTRY: list[CorpusFile] = [
     CorpusFile("sifts_pdb_uniprot.csv", "PDB",
                ["CHAIN", "SP_PRIMARY", "PDB_BEG", "PDB_END", "SP_BEG", "SP_END"]),
     CorpusFile("sifts_pdb_pfam.csv", "PDB",
-               ["CHAIN", "PFAM_ID", "PFAM_NAME", "PDB_BEG", "PDB_END"]),
+               ["CHAIN", "SP_PRIMARY", "PFAM_ID", "COVERAGE"]),
     CorpusFile("sifts_pdb_cath.csv", "PDB", ["CHAIN", "CATH_ID"]),
     CorpusFile("sifts_pdb_scop2.csv", "PDB", ["CHAIN", "SF_DOMID", "FA_DOMID"]),
     CorpusFile("sifts_pdb_enzyme.csv", "PDB", ["CHAIN", "ACCESSION", "EC_NUMBER"]),
