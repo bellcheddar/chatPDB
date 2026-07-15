@@ -44,6 +44,18 @@ MAX_CHUNKS_PER_CSV = {
     # richer per-row data — method, resolution, R-free, title — keep more chunks
     "pdb_entries_enriched": 6_000,
     "pdb_ccd_full": 5_000,
+    # CATH domain-level classification: 601k rows, moderate diversity per row
+    "cath_classification": 8_000,
+    "cath_code_descriptions": 2_000,
+    "interpro_entries": 8_000,
+    "pharos_targets": 2_000,
+    # rich per-row text (function prose, keywords) — high cap so it rarely binds and the
+    # natural CHUNK_SIZE-based sizing dominates instead of forcing extra grouping
+    "uniprot_entries": 20_000,
+    "uniprot_keywords": 2_000,
+    # 870k ligand-instance rows, short per-row (numeric QC fields) — similar order to the
+    # existing ~1M-row SIFTS files
+    "twilight_ligands": 3_000,
     # default cap for any CSV not listed above
     "__default__": 5_000,
 }

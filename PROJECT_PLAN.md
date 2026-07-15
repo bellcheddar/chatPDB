@@ -9,9 +9,11 @@ reasons about structures that already exist, their provenance, and how to query 
 with real tools.
 
 **Author:** Marc C. Deller, D.Phil. ([marcdeller.com](https://marcdeller.com))
-**Status:** Phase 2 (RAG pipeline) complete (2026-07-15). Base model: `mlx-community/Qwen3-32B-4bit`.
-RCSB/SIFTS corpus ingested (27,484 chunks), retrieval + deterministic exact-ID lookup both verified
-against the live model. Phase 3 (SFT dataset) not yet started.
+**Status:** Phase 2 (RAG pipeline) complete (2026-07-15), corpus expansion round complete
+(2026-07-16). Base model: `mlx-community/Qwen3-32B-4bit`. Corpus: 18 files / 65,811 RAG chunks
+(RCSB, SIFTS, CATH, InterPro, Pharos, TWILIGHT, UniProtKB/Swiss-Prot). Retrieval + deterministic
+exact-ID lookup (11 registered files, one two-hop join) both verified against the live model.
+Phase 3 (SFT dataset) not yet started.
 **Fine-tune stack:** MLX-LM on Apple Silicon (committed — same choice chem_sage validated over five
 rounds; see section 3).
 **Sibling project:** [chem_sage](https://github.com/bellcheddar/ChemSage) — a QLoRA-tuned chemistry
@@ -108,18 +110,20 @@ Not a complete list — a starting map, organized by category, with the access m
 `scripts/download_<source>.py`. All of this lands in `data/corpus/`, gitignored.
 
 ### Core wwPDB family (primary structures + metadata)
-- **RCSB PDB** — `data.rcsb.org` REST + GraphQL, `search.rcsb.org` Search API v2, `files.wwpdb.org`
-  derived data. Use the maintained **`rcsb-api`** Python package (`pip install rcsb-api`,
-  github.com/rcsb/py-rcsb-api) rather than hand-rolled requests where it covers the query.
+- **RCSB PDB** ✅ **implemented** (`scripts/download_rcsb.py`, Phase 2) — `data.rcsb.org` REST +
+  GraphQL, `files.wwpdb.org` derived data. (The `rcsb-api` package was evaluated but the hand-rolled
+  GraphQL queries below already cover what's needed; not currently used.)
 - **PDBe** (EMBL-EBI) — `www.ebi.ac.uk/pdbe/api`, separate modules for PDB/EMDB/SIFTS/PISA/validation.
 - **PDBj** (Japan) — the third wwPDB partner; include for completeness and cross-checking.
 - **BMRB** — Biological Magnetic Resonance Data Bank (wwPDB member): NMR restraints/chemical shifts.
 - **EMDB** — cryo-EM map metadata, resolution, FSC curves.
-- **wwPDB Chemical Component Dictionary (CCD) / BIRD** — every ligand/monomer definition. chem_sage's
-  `scripts/download_pdb.py` already pulls a drug-like subset for its own corpus; chatPDB needs the
-  **full** structural CCD, not just the drug-like slice.
-- **wwPDB validation reports** — per-entry XML/PDF validation (Ramachandran outliers, clashscore,
-  R-free gap). Primary source for "structure QC" training examples.
+- **wwPDB Chemical Component Dictionary (CCD) / BIRD** ✅ **implemented** — full 53,417-entry
+  dictionary parsed from the bulk `components.cif.gz` with gemmi (Phase 2), not the drug-like subset.
+- **wwPDB validation reports** — still not directly reachable (RCSB GraphQL's `pdbx_vrpt_summary`
+  doesn't expose clashscore/Rama-outliers at entry level, confirmed by introspection). **TWILIGHT**
+  (ruppweb.org) ✅ **implemented** instead covers the ligand-fit half of this gap — per-ligand-
+  instance RSCC/OWAB density-quality scores, 870k rows (corpus expansion round, 2026-07-15/16).
+  The backbone-level validation metrics (Ramachandran, clashscore) remain unimplemented.
 - **PDB-REDO** — re-refined/re-built X-ray structures; a good source of "what changed and why" pairs.
 
 ### Predicted / computational structures
@@ -135,20 +139,41 @@ Not a complete list — a starting map, organized by category, with the access m
   a dedicated downloader; treat it as a growing source to poll periodically, not a one-shot pull.
 
 ### Sequence, domain & fold classification
-- **UniProtKB** (Swiss-Prot + TrEMBL) — REST + SPARQL, canonical sequence/function annotation and
-  PDB cross-references.
-- **Pfam / InterPro** — InterPro now hosts Pfam; domain family annotation.
-- **CATH** and **SCOP2** — evolutionary/structural domain classification.
-- **Gene3D** — CATH-based domain assignment at proteome scale.
+- **UniProtKB/Swiss-Prot** ✅ **implemented** (`scripts/download_uniprot.py`, corpus expansion round)
+  — REST batch endpoint, scoped to the 73,910 accessions cross-referenced to a PDB structure (not
+  all of Swiss-Prot/TrEMBL). Also pulled: the 1,201-entry controlled-vocabulary keyword list.
+- **Pfam** ✅ (via SIFTS mapping, Phase 2) / **InterPro** ✅ **implemented**
+  (`scripts/download_interpro.py`) — full 54,190-entry dictionary (name/type/GO terms), not just the
+  PDB-referenced subset.
+- **CATH** ✅ **implemented** (`scripts/download_cath.py`) — full classification hierarchy
+  (601,328 domains, 8,151 named codes), joined to the SIFTS PDB→CATH-domain-ID mapping.
+  **SCOP2** — deferred: SCOP has migrated fully under PDBe as a JS SPA with no discoverable public
+  API (multiple candidate hosts tried and failed, 2026-07-16); only the SIFTS domain-ID mapping
+  (no fold descriptions) is available for now.
+- **Gene3D** — not yet pursued.
 
 ### Cross-reference & interaction annotation
-- **SIFTS** (EBI) — residue-level PDB↔UniProt↔Pfam↔CATH↔IntEnz mapping. chem_sage already has a
-  working downloader pattern for this in `download_pdb.py` (SIFTS section) worth porting directly.
-- **PDBe-KB** — aggregated per-entry knowledge base (functional sites, ligand interactions, conservation).
-- **PDBsum** — pictorial per-structure summaries, interaction diagrams.
-- **PISA** (EBI) — quaternary structure/interface/assembly analysis (biological assembly vs.
-  asymmetric unit — a distinction chatPDB should be fluent in explaining).
-- **ProtCID** — protein interface comparison across the PDB.
+- **SIFTS** (EBI) ✅ **implemented** (`scripts/download_rcsb.py`, Phase 2) — UniProt, Pfam, CATH,
+  SCOP2, EC/enzyme, GO, InterPro chain mappings (7 files). Two of chem_sage's original file names
+  (`cc-counts.tdd`, `pdb_chain_cath_scop.csv.gz`) have been retired upstream since it was written;
+  verify the live directory listing before trusting any inherited filename.
+- **PDBe-KB** — deferred: real, working per-entry REST API, but no bulk endpoint (256k requests to
+  cover the full corpus is impractical in one pass); RCSB's GraphQL enrichment already covers most
+  of the same ground.
+- **PDBsum** — deferred, and not really a corpus source: `PDBsum1` (a specific tool Marc pointed at,
+  github.com/RomanLas/PDBsum1) is a local install-and-run generator with no bulk data or API: it
+  processes a user-supplied PDB file into interaction diagrams. Better fit as a Phase 6 tool-calling
+  candidate alongside PyMOL, not a Phase 2 download target.
+- **PISA** (EBI) — deferred: real, working per-assembly REST API
+  (`ebi.ac.uk/pdbe/api/pisa/assembly/:pdbid/:assemblyid`), no bulk endpoint, same 256k-request
+  problem as PDBe-KB.
+- **ProtCID** — not yet pursued.
+- **Pharos** (pharos.nih.gov, not in the original brainstorm — added on request) ✅ **implemented**
+  (`scripts/download_pharos.py`) — target druggability/development level (TDL), joined via UniProt
+  accession. Bulk pagination (`targets(top,skip)`) is broken server-side (confirmed via schema
+  introspection — silently returns the same 10 targets regardless of arguments); per-target lookup
+  works, so this is scoped to the top 2,000 PDB-cross-referenced UniProt accessions by structure
+  count rather than all ~20k human targets.
 
 ### Ligand & binding data
 - **PDBbind** — measured binding affinities for protein-ligand complexes. chem_sage already has a
@@ -356,6 +381,84 @@ Qwen3-32B-4bit (thinking disabled), the model correctly answered "resolution of 
 value of 0.203... Chain A... maps to the UniProt accession P02185" and cited the corpus context —
 the actual grounded-answer loop, not just retrieval in isolation.
 
+### Corpus expansion round (2026-07-15/16)
+
+Before starting Phase 3, Marc asked to flesh out the corpus further: named sources (PDBeChem, SCOP,
+CATH, InterPro, Pharos, PDBePISA, PDBsum1, TWILIGHT, UniProtKB/Swiss-Prot, ExPASy) plus a broader
+search for anything still missing. Every source below was verified live (curl/introspection) before
+writing a downloader — three separate stale-API assumptions had already bitten Phase 2 (retired
+index files, a changed column layout), so nothing went in on the strength of documentation alone.
+
+**Implemented and ingested** (5 new downloaders, `scripts/download_{cath,interpro,pharos,twilight,
+uniprot}.py`, all ported to the same session/GraphQL/pagination patterns as `download_rcsb.py`):
+
+| Source | What it adds | Scale | Access method |
+|---|---|---|---|
+| **CATH** | Domain fold classification (Class/Architecture/Topology/Homology descriptions), joined to the existing SIFTS PDB→CATH-domain-ID mapping | 601,328 domains, 8,151 named codes | Bulk HTTPS mirror of CATH's FTP release (`download.cathdb.info`) — two flat files, gemmi not needed, plain text parse |
+| **InterPro** | Entry name/type/GO terms/member-database cross-refs for all InterPro domains (not just the ones referenced in PDB — full dictionary) | 54,190 entries | REST API, cursor-paginated, 200/page (~271 requests) |
+| **Pharos** | Target druggability (TDL: Tclin/Tchem/Tbio/Tdark), family, disease associations — joins via UniProt accession to the existing SIFTS PDB→UniProt mapping | 722 targets matched (top 2,000 PDB-cross-referenced UniProt accessions by structure count, ranked) | GraphQL, per-target lookup (bulk `targets(top,skip)` pagination is broken server-side — see below) |
+| **TWILIGHT** | Per-ligand-instance electron-density fit quality (RSCC, OWAB) — the "structure QC" data Phase 2's original RCSB pull couldn't reach (`pdbx_vrpt_summary` doesn't expose it) | 870,386 ligand instances | Single bulk bzip2 TSV snapshot (2020-01-15; not live-updated) |
+| **UniProtKB/Swiss-Prot** | Protein name, function (curated prose), organism, keywords for every UniProt accession cross-referenced to a PDB structure, plus the full 1,201-entry controlled-vocabulary keyword list | 73,910 entries (100% of unique accessions in `sifts_pdb_uniprot.csv`) + 1,201 keywords | REST batch endpoint (`/uniprotkb/accessions`, 100/request, ~740 requests) + `/keywords/stream` (single request) |
+
+Full corpus now: **18 files, 65,811 RAG chunks** (up from 10 files / 27,484 chunks after Phase 2's
+initial RCSB/SIFTS pull). `rag/corpus_lookup.py`'s registry grew from 8 to 11 files, plus a new
+two-hop join (PDB → SIFTS CATH-domain-ID → CATH classification description) and two new ID
+patterns (UniProt accession, InterPro accession) so the exact-lookup fast path covers all of it, not
+just the original RCSB/SIFTS set.
+
+**Deliberately deferred** (researched, access method identified, not pulled — reasons below so this
+doesn't get silently reattempted or silently forgotten):
+
+- **PDBePISA** — real, working REST API (`ebi.ac.uk/pdbe/api/pisa/assembly/:pdbid/:assemblyid`), but
+  per-entry only, no bulk endpoint. 256k entries × a request each is impractical in one pass.
+- **PDBeChem enrichment** — RCSB's bulk CCD (already ingested via `pdb_ccd_full.csv`) covers
+  SMILES/formula/name; PDBeChem's REST API adds cross-refs to BRENDA/Probes-and-Drugs/systematic
+  names, but only per-compound (`ebi.ac.uk/pdbe/api/pdb/compound/summary/:id`) — 50k+ requests for
+  marginal, chemistry-adjacent (not structural) value.
+- **PDBe-KB entry/funpdbe annotations** — real, working, per-entry only (confirmed via
+  `ebi.ac.uk/pdbe/api/pdb/entry/summary/:id`); RCSB's GraphQL enrichment already covers most of the
+  same ground (assembly/entity composition) that would justify a 256k-request pull.
+- **SCOP2 full classification hierarchy** — SCOP has migrated fully under PDBe (redirects to
+  `ebi.ac.uk/pdbe/scop/`, a JS SPA); could not find a working public API endpoint after exhausting
+  reasonable discovery (tried `rest.scop.mrc-lmb.cam.ac.uk`, `supfam.mrc-lmb.cam.ac.uk`, HTML
+  comment hints — none resolved). SIFTS's PDB→SCOP2-domain-ID mapping (`sifts_pdb_scop2.csv`,
+  already ingested) still gives partial cross-referencing without the fold descriptions.
+- **PhosphoSitePlus** — bulk download requires a paid/registered license (commercial tiers
+  $5k–$20k/yr; academic terms require direct application) — not something to script around.
+- **PDBsum1** (github.com/RomanLas/PDBsum1) — not a data source at all: a local install-and-run
+  tool that processes a user-supplied PDB file into interaction diagrams. No bulk data, nothing to
+  download. Worth revisiting as a **tool-calling candidate** for Phase 6 (`rag/tool_exec.py`)
+  instead, alongside PyMOL — noted for that phase, not pursued now.
+
+**Bugs found and fixed while implementing the above** (beyond the two already logged in the main
+Phase 2 section):
+
+1. **Pharos bulk pagination is broken.** `targets(top, skip)` silently ignores both arguments
+   (confirmed via schema introspection — they're real, correctly-typed `Int` args, not a naming
+   mistake) and always returns the same first 10 targets regardless of what's requested, with
+   inline literal values too (not a variable-passing bug). First attempt appeared to succeed
+   (20,420 rows written) but was 100% duplicate data (10 unique symbols total) — caught by checking
+   `nunique()` on the output, not by any error. Fixed by switching to per-target lookup
+   (`target(q:{uniprot:...})`, confirmed working) against a prioritised subset instead of the
+   broken bulk path.
+2. **`scripts/download_interpro.py` hung indefinitely when run via a backgrounded/long-lived
+   process**, specifically — a bare synchronous `requests.get()` to the identical URL always
+   succeeded in seconds, and `curl` never had any trouble either. Reproduced repeatedly: CPU time
+   frozen at effectively zero for 15+ minutes, an ESTABLISHED-but-silent TCP connection to
+   `pg-www.ebi.ac.uk`. Root-caused to `requests.Session()` connection pooling reusing a socket that
+   had gone dead without the OS or urllib3 noticing — the client-side read timeout should have
+   caught this but didn't. Fixed by dropping `Session()` entirely in favour of one-off
+   `requests.get(..., headers={"Connection": "close"})` calls per page, plus per-page disk
+   checkpointing every 20 pages so a future stall doesn't lose all prior progress. Same fix applied
+   preventatively to `download_uniprot.py`, which ran its full 740-request pull cleanly afterward.
+
+**Row-count caps added to `ingest_rag.py`** for the new large files: `cath_classification`
+(8,000-chunk cap, 601k rows), `interpro_entries` (8,000, 54k rows), `uniprot_entries` (20,000 — high
+on purpose so the natural per-row chunk sizing dominates over grouping, since function/keyword text
+per row is already substantial), `twilight_ligands` (3,000, 870k rows). None needed the
+pre-chunking row-sampling `sifts_pdb_go`/`sifts_pdb_interpro` required — none are large enough
+relative to their cap to blow past a reasonable chunk size the way a 16M-row file would.
+
 ### Phase 3 — SFT dataset (the real work, 3–5 days)
 All four behaviour classes weighted equally (Marc's call):
 1. **File/format literacy** — PDB vs. mmCIF vs. PDBML, header records, CCD components, format
@@ -458,7 +561,12 @@ chatPDB/
 ├── scripts/
 │   ├── preflight.sh / postflight.sh   # ported from chem_sage + iCloud dataless-file check
 │   ├── monitor_training.sh
-│   ├── download_<source>.py           # one per data source in section 4 (added Phase 2)
+│   ├── download_rcsb.py                # RCSB entries + CCD + SIFTS (Phase 2)
+│   ├── download_cath.py                # CATH classification hierarchy
+│   ├── download_interpro.py            # InterPro entry dictionary
+│   ├── download_pharos.py              # target druggability, joined via UniProt
+│   ├── download_twilight.py            # per-ligand density-quality (RSCC/OWAB)
+│   ├── download_uniprot.py             # Swiss-Prot entries + keyword vocabulary
 │   ├── survey_base_models.py          # Phase 1 candidate benchmarking
 │   ├── build_dataset.py               # SFT generator (Phase 3)
 │   ├── ingest_rag.py                  # (Phase 2)
