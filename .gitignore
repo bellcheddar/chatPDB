@@ -2,6 +2,7 @@
 data/corpus/
 data/sft/*.jsonl
 data/structures/
+data/structures_all/
 data/structures_pool_ids.csv
 adapters/
 fused_model/

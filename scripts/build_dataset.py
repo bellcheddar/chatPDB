@@ -32,7 +32,7 @@ from pathlib import Path
 import pandas as pd
 
 CORPUS = Path("data/corpus")
-STRUCTURES = Path("data/structures")
+STRUCTURES = Path("data/structures_all")  # 256,444 real mmCIF files, corpus expansion round 2
 OUT = Path("data/sft")
 SYSTEM_PROMPT_PATH = Path("config/system_prompt.txt")
 
@@ -45,6 +45,18 @@ def load_corpus() -> dict:
     print("Loading corpus tables ...")
     c = {}
     c["entries"] = pd.read_csv(CORPUS / "rcsb/pdb_entries_enriched.csv")
+    # Columns pandas sometimes infers as object/str dtype (a handful of non-numeric stray values
+    # mixed among 256k rows, e.g. from the GraphQL response returning null differently across
+    # batches) — cast explicitly rather than let a single :.2f in an f-string blow up on a str.
+    _numeric_cols = [
+        "cell_a", "cell_b", "cell_c", "cell_alpha", "cell_beta", "cell_gamma",
+        "crystallization_pH", "crystallization_temp_K", "diffraction_ambient_temp_K",
+        "diffraction_wavelength_A", "citation_year", "citation_pubmed_id",
+        "primary_sequence_length", "taxonomy_id", "assembly_count",
+    ]
+    for col in _numeric_cols:
+        if col in c["entries"].columns:
+            c["entries"][col] = pd.to_numeric(c["entries"][col], errors="coerce")
     c["all_entries"] = pd.read_csv(CORPUS / "rcsb/pdb_all_entries.csv")
     c["ccd"] = pd.read_csv(CORPUS / "rcsb/pdb_ccd_full.csv")
     c["ccd"]["formula_weight"] = pd.to_numeric(c["ccd"]["formula_weight"], errors="coerce")
@@ -65,7 +77,7 @@ def load_corpus() -> dict:
     c["cath_joined"] = cath
 
     # Structure pool actually on disk (for execution-verified generators).
-    c["structure_files"] = sorted(STRUCTURES.glob("*.pdb"))
+    c["structure_files"] = sorted(STRUCTURES.glob("*.cif"))  # sorted for --seed reproducibility
     print(f"  {len(c['entries']):,} entries, {len(c['structure_files']):,} downloaded structure files")
     return c
 
@@ -361,6 +373,56 @@ def gen_twilight_ligand_fit(df: pd.DataFrame, rng: random.Random, n: int) -> lis
     return out
 
 
+def gen_unit_cell_space_group(df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    rows = df[df["space_group"].notna() & df["cell_a"].notna()].sample(
+        n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = rng.choice([
+            f"What are the unit cell parameters and space group of PDB entry {r['pdb_id']}?",
+            f"Describe the crystal lattice for PDB entry {r['pdb_id']}.",
+        ])
+        a = (
+            f"Entry {r['pdb_id']}: space group {r['space_group']}, unit cell a={r['cell_a']:.2f} Å, "
+            f"b={r['cell_b']:.2f} Å, c={r['cell_c']:.2f} Å, α={r['cell_alpha']:.1f}°, "
+            f"β={r['cell_beta']:.1f}°, γ={r['cell_gamma']:.1f}°. The space group defines the "
+            f"crystallographic symmetry operations that generate the full crystal lattice from the "
+            f"asymmetric unit; the unit cell dimensions are the repeating box those operations act "
+            f"within. Together they're what a molecular replacement or Patterson search uses to place "
+            f"the model, and they're recorded in the file's CRYST1 record (legacy PDB) or the "
+            f"`_cell`/`_symmetry` categories (mmCIF)."
+        )
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
+def gen_crystallization_conditions(df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    rows = df[df["crystallization_pH"].notna() | df["crystallization_method"].notna()].sample(
+        n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"Under what conditions was PDB entry {r['pdb_id']} crystallized?"
+        parts = []
+        if pd.notna(r.get("crystallization_method")) and r["crystallization_method"]:
+            parts.append(f"method: {r['crystallization_method']}")
+        if pd.notna(r.get("crystallization_pH")):
+            parts.append(f"pH {r['crystallization_pH']:.1f}")
+        if pd.notna(r.get("crystallization_temp_K")):
+            parts.append(f"{r['crystallization_temp_K']:.0f} K")
+        if pd.notna(r.get("diffraction_wavelength_A")):
+            parts.append(f"diffraction wavelength {r['diffraction_wavelength_A']:.4f} Å")
+        detail = "; ".join(parts) if parts else "not recorded in detail for this entry"
+        a = (
+            f"Recorded crystallization/diffraction conditions for {r['pdb_id']}: {detail}. These "
+            f"parameters matter for interpreting the structure: pH and temperature affect which "
+            f"conformational or protonation state was captured, and the diffraction wavelength (often "
+            f"a synchrotron-tunable value, not always the lab Cu-Kα 1.5418 Å) matters for anomalous "
+            f"scattering experiments and resolution limits achievable."
+        )
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Class 3: tool_calling
 # ---------------------------------------------------------------------------
@@ -439,28 +501,20 @@ def gen_pymol_script(df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]
     return out
 
 
-def _run_dssp(path: Path) -> dict[str, int] | None:
-    """Run DSSP and return {SS_code: count}, or None if it can't be assigned.
-
-    Feeds mkdssp a gemmi-produced mmCIF rather than the original legacy .pdb file: mkdssp 4.6.1's
-    own internal PDB->mmCIF conversion has a real bug (confirmed 2026-07-16 against this structure
-    pool) that raises a 'Duplicate Key violation' on modern REMARK 3 refinement-statistics blocks
-    (multiple TLS groups etc.) — it failed on the majority of this pool's post-2015 X-ray entries.
-    gemmi's converter doesn't hit this; running mkdssp against its output sidesteps the bug
-    entirely while still computing genuine secondary structure from the same real coordinates."""
-    import gemmi
+def _run_dssp_mmcif(path: Path) -> dict[str, int] | None:
+    """Run DSSP directly against a native mmCIF file and return {SS_code: count}, or None if it
+    can't be assigned. data/structures_all/ is downloaded as mmCIF straight from RCSB (not
+    converted from legacy PDB), so mkdssp 4.6.1's internal legacy-PDB->mmCIF conversion bug
+    (confirmed 2026-07-16 against the smaller data/structures/ pool, see PROJECT_PLAN.md Phase 3)
+    doesn't apply here at all — no gemmi pre-conversion workaround needed, verified directly
+    against this pool before writing this function."""
     from Bio.PDB import MMCIFParser
     from Bio.PDB.DSSP import DSSP
 
-    with tempfile.NamedTemporaryFile(suffix=".cif", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
     try:
-        st = gemmi.read_structure(str(path))
-        st.setup_entities()
-        st.make_mmcif_document().write_file(str(tmp_path))
-        structure = MMCIFParser(QUIET=True).get_structure(path.stem, str(tmp_path))
+        structure = MMCIFParser(QUIET=True).get_structure(path.stem, str(path))
         model = structure[0]
-        dssp = DSSP(model, str(tmp_path), dssp="mkdssp", file_type="mmCIF")
+        dssp = DSSP(model, str(path), dssp="mkdssp", file_type="mmCIF")
         counts: dict[str, int] = {}
         for key in dssp.keys():
             ss = dssp[key][2]
@@ -468,32 +522,32 @@ def _run_dssp(path: Path) -> dict[str, int] | None:
         return counts or None
     except Exception:
         return None
-    finally:
-        tmp_path.unlink(missing_ok=True)
 
 
 def gen_dssp_secondary_structure(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
-    """Execution-verified: actually runs DSSP against real downloaded files. Capped by pool size."""
+    """Execution-verified: actually runs DSSP against real downloaded mmCIF files from the full
+    256k-entry pool (data/structures_all/, corpus expansion round) — no longer capped at the
+    original 820-file data/structures/ sample."""
     out = []
     sample = rng.sample(structure_files, k=min(n * 2, len(structure_files)))  # oversample: some are nucleic-acid-only and yield no SS
     for path in sample:
         if len(out) >= n:
             break
         pid = path.stem.upper()
-        counts = _run_dssp(path)
+        counts = _run_dssp_mmcif(path)
         if not counts:
             continue
         helix = counts.get("H", 0) + counts.get("G", 0) + counts.get("I", 0)
         strand = counts.get("E", 0) + counts.get("B", 0)
         total = sum(counts.values())
-        q = f"Write Biopython/DSSP code to assign secondary structure to PDB entry {pid} (file `{path.name}`) and summarise the helix/strand content."
+        q = f"Write Biopython/DSSP code to assign secondary structure to PDB entry {pid} (mmCIF file `{path.name}`) and summarise the helix/strand content."
         a = (
             "```python\n"
-            "from Bio.PDB import PDBParser\n"
+            "from Bio.PDB import MMCIFParser\n"
             "from Bio.PDB.DSSP import DSSP\n\n"
-            f"structure = PDBParser(QUIET=True).get_structure('{pid}', '{path.name}')\n"
+            f"structure = MMCIFParser(QUIET=True).get_structure('{pid}', '{path.name}')\n"
             "model = structure[0]\n"
-            f"dssp = DSSP(model, '{path.name}', dssp='mkdssp')\n"
+            f"dssp = DSSP(model, '{path.name}', dssp='mkdssp', file_type='mmCIF')\n"
             "ss_counts = {}\n"
             "for key in dssp.keys():\n"
             "    ss = dssp[key][2]\n"
@@ -503,10 +557,6 @@ def gen_dssp_secondary_structure(structure_files: list[Path], rng: random.Random
             f"Running DSSP on the real deposited coordinates for {pid} gives {total} assigned residues: "
             f"{helix} in helix (H/G/I), {strand} in strand (E/B) — "
             f"{'a predominantly helical structure' if helix > strand * 1.5 else 'a predominantly beta structure' if strand > helix * 1.5 else 'a mixed alpha/beta structure'}."
-            + (" (Note: if `dssp='mkdssp'` raises a parse error on a legacy .pdb file with an "
-               "unusual REMARK 3 block, convert to mmCIF with gemmi first and pass `file_type='mmCIF'` "
-               "— a known mkdssp 4.x limitation, not a Biopython issue.)"
-               if rng.random() < 0.15 else "")
         )
         out.append(make_example(q, a, "tool_calling"))
     return out
@@ -519,16 +569,16 @@ def gen_nmr_model_count(structure_files: list[Path], entries_df: pd.DataFrame, r
     for path in rng.sample(nmr_files, k=min(n, len(nmr_files))):
         pid = path.stem.upper()
         try:
-            from Bio.PDB import PDBParser
-            structure = PDBParser(QUIET=True).get_structure(pid, str(path))
+            from Bio.PDB import MMCIFParser
+            structure = MMCIFParser(QUIET=True).get_structure(pid, str(path))
             n_models = len(structure)
         except Exception:
             continue
-        q = f"Write Biopython code to count how many NMR models are present in PDB entry {pid} (file `{path.name}`)."
+        q = f"Write Biopython code to count how many NMR models are present in PDB entry {pid} (mmCIF file `{path.name}`)."
         a = (
             "```python\n"
-            "from Bio.PDB import PDBParser\n\n"
-            f"structure = PDBParser(QUIET=True).get_structure('{pid}', '{path.name}')\n"
+            "from Bio.PDB import MMCIFParser\n\n"
+            f"structure = MMCIFParser(QUIET=True).get_structure('{pid}', '{path.name}')\n"
             "print('Models:', len(structure))\n"
             "```\n\n"
             f"The real deposited file for {pid} contains {n_models} models — this is the NMR ensemble "
@@ -675,6 +725,51 @@ def gen_ccd_identity(df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]
     return out
 
 
+def gen_citation(df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    rows = df[df["citation_title"].notna() & (df["citation_title"] != "")].sample(
+        n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = rng.choice([
+            f"What paper originally described PDB entry {r['pdb_id']}?",
+            f"Find the primary literature citation for PDB entry {r['pdb_id']}.",
+        ])
+        cite = f"\"{r['citation_title']}\""
+        if pd.notna(r.get("citation_journal")) and r["citation_journal"]:
+            cite += f", {r['citation_journal']}"
+        if pd.notna(r.get("citation_year")):
+            cite += f" ({int(r['citation_year'])})"
+        a = f"The primary citation for {r['pdb_id']} is: {cite}."
+        if pd.notna(r.get("citation_doi")) and r["citation_doi"]:
+            a += f" DOI: {r['citation_doi']}."
+        if pd.notna(r.get("citation_pubmed_id")) and r["citation_pubmed_id"] and int(r["citation_pubmed_id"]) > 0:
+            a += f" PubMed ID: {int(r['citation_pubmed_id'])}."
+        a += (" This is the `rcsb_primary_citation` category in the entry's mmCIF file — the paper "
+              "the depositors themselves designated as the primary reference, not necessarily every "
+              "paper that has ever used this structure.")
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_organism_taxonomy(df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    rows = df[df["organism"].notna() & (df["organism"] != "")].sample(
+        n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"What organism does the protein in PDB entry {r['pdb_id']} come from, and how long is its sequence?"
+        a = f"The primary polymer entity in {r['pdb_id']} is from {r['organism']}"
+        if pd.notna(r.get("taxonomy_id")):
+            a += f" (NCBI taxonomy ID {int(r['taxonomy_id'])})"
+        a += "."
+        if pd.notna(r.get("primary_sequence_length")):
+            a += f" Its deposited sequence is {int(r['primary_sequence_length'])} residues long."
+        a += (" This comes from the entry's `rcsb_entity_source_organism` and `entity_poly` "
+              "categories — for multi-entity complexes, other chains may be from different organisms "
+              "entirely (e.g. a human target with a viral or bacterial binding partner).")
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Refusal boundary (supplementary, small)
 # ---------------------------------------------------------------------------
@@ -728,16 +823,21 @@ def main() -> None:
     all_examples += gen_format_pdb_vs_mmcif(c["entries"][c["entries"]["atom_count"] > 20000], rng, k)
     all_examples += gen_biological_assembly_asu(c["entries"], rng, k)
 
-    # experimental_method — split across 5 generators
-    k = per_class // 5
+    # experimental_method — split across 7 generators (added unit_cell/space_group and
+    # crystallization_conditions once the expanded RCSB metadata pull made them possible)
+    k = per_class // 7
     print("Generating experimental_method ...")
     all_examples += gen_xray_resolution_quality(c["entries"], rng, k)
     all_examples += gen_rfree_quality(c["entries"], rng, k)
     all_examples += gen_em_resolution_quality(c["entries"], rng, k)
     all_examples += gen_nmr_characteristics(c["entries"], rng, k)
     all_examples += gen_twilight_ligand_fit(c["twilight"], rng, k)
+    all_examples += gen_unit_cell_space_group(c["entries"], rng, k)
+    all_examples += gen_crystallization_conditions(c["entries"], rng, k)
 
-    # tool_calling — split across 5 generators (2 execution-verified, capped by pool size)
+    # tool_calling — split across 5 generators. DSSP and NMR-model-count are execution-verified
+    # against the full 256,444-file mmCIF pool (data/structures_all/, corpus expansion round 2)
+    # now, not the original 820-file sample — no longer the bottleneck it was in round 1.
     k = per_class // 5
     print("Generating tool_calling ...")
     all_examples += gen_biopython_count(c["entries"], rng, k)
@@ -747,8 +847,9 @@ def main() -> None:
     all_examples += gen_dssp_secondary_structure(c["structure_files"], rng, k)
     all_examples += gen_nmr_model_count(c["structure_files"], c["entries"], rng, k)
 
-    # database_cross_referencing — split across 7 generators
-    k = per_class // 7
+    # database_cross_referencing — split across 9 generators (added citation and
+    # organism/taxonomy once the expanded RCSB metadata pull made them possible)
+    k = per_class // 9
     print("Generating database_cross_referencing ...")
     all_examples += gen_uniprot_chain_mapping(c["sifts_uniprot"], rng, k)
     all_examples += gen_pfam_domain(c["sifts_pfam"], rng, k)
@@ -757,6 +858,8 @@ def main() -> None:
     all_examples += gen_uniprot_function(c["uniprot"], rng, k)
     all_examples += gen_pharos_druggability(c["pharos"], c["sifts_uniprot"], rng, k)
     all_examples += gen_ccd_identity(c["ccd"], rng, k)
+    all_examples += gen_citation(c["entries"], rng, k)
+    all_examples += gen_organism_taxonomy(c["entries"], rng, k)
 
     # supplementary refusal boundary
     print("Generating refusal_boundary ...")

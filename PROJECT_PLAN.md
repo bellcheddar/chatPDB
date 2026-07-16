@@ -9,9 +9,12 @@ reasons about structures that already exist, their provenance, and how to query 
 with real tools.
 
 **Author:** Marc C. Deller, D.Phil. ([marcdeller.com](https://marcdeller.com))
-**Status:** Phase 3 (SFT dataset) complete (2026-07-16). Base model: `mlx-community/Qwen3-32B-4bit`.
-RAG corpus: 18 files / 65,811 chunks. SFT dataset v1: 45,502 examples (36,402 train / 4,550 valid /
-4,550 test) — more than double chem_sage's largest round (20,000, R5), generated in one pass.
+**Status:** Phase 3 (SFT dataset) complete, round 2 (2026-07-16): full structure pool (256,444
+mmCIF files, 353 GB, every PDB entry) and expanded RCSB metadata (unit cell, space group,
+crystallization conditions, citation, sequence, taxonomy — all fields, not a subset). Base model:
+`mlx-community/Qwen3-32B-4bit`. RAG corpus: 18 files / 65,811 chunks. SFT dataset v2: 50,233
+examples (40,187 train / 5,023 valid / 5,023 test), full 50,000 target hit, `tool_calling` at its
+complete 12,500 target for the first time. More than double chem_sage's largest round (20,000, R5).
 Phase 4 (QLoRA fine-tune) not yet started.
 **Fine-tune stack:** MLX-LM on Apple Silicon (committed — same choice chem_sage validated over five
 rounds; see section 3).
@@ -516,6 +519,59 @@ done manually; every example read as something Marc would have written, no fabri
 hedge-text template leaks (one found and fixed — a literal "if applicable" leaking into prose
 regardless of whether the value was actually present).
 
+**Round 2 (2026-07-16): "let's add ALL PDB files and ALL fields from the PDB for each entry to
+SFT."** A deliberate escalation from round 1's scoped-down approach (820-file stratified sample,
+limited GraphQL field set) — Marc asked for full literal coverage instead. Given the resource
+implications (150–400 GB, 8–25+ hours for a literal-all file download), this was clarified with
+Marc first rather than just launched: confirmed literal all 256,448 entries, mmCIF over legacy PDB
+(universal coverage, and it's the format the DSSP fix below already made the robust choice), and
+expanding the metadata query as an independent, much cheaper step.
+
+**`scripts/download_all_structures.py`** — every entry as native mmCIF. Sequential download at any
+sensible pause would have taken the better part of a day; empirically tested concurrency (8 → 24 →
+32 → 64 → 96 parallel workers) against the real endpoint before committing to a setting, since
+`files.rcsb.org` is a static-file CDN, not the rate-limited Search/Data API the commonly-quoted
+~10 req/s guideline is documented for. Throughput plateaued around 64 workers (~7.3 files/s in
+testing; **13.0 files/s sustained** in the actual full run) — diminishing returns beyond that, so 64
+was kept as a courtesy ceiling rather than pushed further for a run that would finish in ~5.5h either
+way. Fully resumable (skips existing files, logs failures separately for `--retry-failed`).
+**Result: 256,444/256,448 entries downloaded (99.998%) in 5.52h, 353 GB, only 5 genuine failures.**
+
+**Expanded `ENTRY_ENRICH_GQL`** (in `download_rcsb.py`) — added, all verified live before writing
+the bigger query: unit cell (`cell`), space group (`symmetry`), crystallization conditions
+(`exptl_crystal_grow`: pH/temp/method), diffraction (`diffrn`, `diffrn_source`: wavelength),
+primary citation (`rcsb_primary_citation`: title/journal/year/DOI/PubMed ID), and per polymer
+entity: full sequence, sequence length, source organism, NCBI taxonomy ID, plus `assembly_count`.
+Re-ran the full 256,448-entry enrichment with the bigger query.
+
+**A second connection-pooling stall**, same failure mode as `download_interpro.py`'s (Phase 2):
+the re-enrichment run showed "completed" only 42 seconds of real CPU time after 5h22m elapsed, a
+connection stuck in `CLOSE_WAIT`. `download_rcsb.py`'s module-level `requests.Session()` was the
+cause here too, just against `data.rcsb.org` instead of EBI — confirming this is a general pattern
+worth watching for on this machine (long-lived pooled connections against *any* host can go
+silently dead), not a one-off EBI quirk. Fixed identically: dropped the Session object for one-off
+`Connection: close` requests, added retry-with-backoff and checkpointing every 400 batches to
+`graphql()`/`step2_entry_enrichment()`. Re-ran cleanly: 256,448/256,448 entries in well under an
+hour, steady progress confirmed by CPU-time monitoring before trusting it to run unattended.
+
+**DSSP generator simplified, not just rescaled.** Since `data/structures_all/` is native mmCIF
+(never converted from legacy PDB), round 1's gemmi-pre-conversion workaround for mkdssp's
+legacy-PDB→mmCIF bug doesn't apply — confirmed directly (`mkdssp` ran cleanly against a sample
+native `.cif` with no `Duplicate Key violation`) before simplifying `_run_dssp()` into
+`_run_dssp_mmcif()`, which runs `mkdssp` straight against the downloaded file. A different, milder
+version of the same class of dictionary-validation error still appears on a small fraction of
+*native* RCSB mmCIF files (a handful of `refine_ls_shell`/`pdbx_database_related` duplicate-key
+cases) — the generator's existing oversample-and-skip tolerance absorbed this without needing a
+further fix; the DSSP sub-generator still hit its full target.
+
+**Result: `tool_calling` reaches its complete 12,500 target for the first time** (round 1: 8,010,
+capped by the 820-file pool). Four new generators added from the expanded metadata
+(`gen_citation`, `gen_unit_cell_space_group`, `gen_crystallization_conditions`,
+`gen_organism_taxonomy`). Full re-run: **50,233 examples** (40,187 train / 5,023 valid / 5,023
+test), the original 50,000 target hit cleanly. `corpus_lookup.py`'s registry and the RAG corpus were
+also updated/re-ingested with the expanded `pdb_entries_enriched.csv` fields. Full narrative,
+class balance, and token stats in `data/README.md`'s v2 entry.
+
 ### Phase 4 — QLoRA fine-tune with MLX-LM (0.5–1 day of compute)
 `config/train_config.yaml` seeded from chem_sage's validated field names and values (rank, RSLoRA,
 `steps_per_report == steps_per_eval` from round one — chem_sage had to learn this the hard way,
@@ -605,6 +661,8 @@ chatPDB/
 │   ├── download_pharos.py              # target druggability, joined via UniProt
 │   ├── download_twilight.py            # per-ligand density-quality (RSCC/OWAB)
 │   ├── download_uniprot.py             # Swiss-Prot entries + keyword vocabulary
+│   ├── download_structure_pool.py      # 820-file PDB-format sample (Phase 3 round 1)
+│   ├── download_all_structures.py      # all 256,444 entries as mmCIF, 353 GB (Phase 3 round 2)
 │   ├── survey_base_models.py          # Phase 1 candidate benchmarking
 │   ├── build_dataset.py               # SFT generator (Phase 3)
 │   ├── ingest_rag.py                  # (Phase 2)

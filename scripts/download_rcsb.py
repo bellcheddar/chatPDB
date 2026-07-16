@@ -59,19 +59,24 @@ WWPDB = "https://files.wwpdb.org/pub/pdb/derived_data"
 WWPDB_MONOMERS = "https://files.wwpdb.org/pub/pdb/data/monomers"
 SIFTS_BASE = "https://ftp.ebi.ac.uk/pub/databases/msd/sifts/flatfiles/csv"
 
-S = requests.Session()
-S.headers["User-Agent"] = "chatPDB/1.0 (protein-structure-rag; marc@marcdeller.com)"
+_HEADERS = {"User-Agent": "chatPDB/1.0 (protein-structure-rag; marc@marcdeller.com)", "Connection": "close"}
 PAUSE = 0.15
 
 
 # ---------------------------------------------------------------------------
 # Helpers (ported from chem_sage/scripts/download_pdb.py)
+#
+# No requests.Session(): confirmed live 2026-07-16 (5h22m stall on the full 256k-entry GraphQL
+# enrichment run, 42s of actual CPU time used, a connection stuck in CLOSE_WAIT) that pooled
+# connection reuse can hang indefinitely against RCSB too, the same failure mode already found
+# and fixed against EBI in scripts/download_interpro.py. One-off requests with Connection: close
+# cost an extra TCP+TLS handshake per call but don't have this failure mode.
 # ---------------------------------------------------------------------------
 
 def download_text(url: str, label: str, timeout: int = 300) -> str:
     print(f"  Downloading {label} ...")
     try:
-        r = S.get(url, timeout=timeout, stream=True)
+        r = requests.get(url, headers=_HEADERS, timeout=timeout, stream=True)
         r.raise_for_status()
         return r.text
     except Exception as e:
@@ -83,7 +88,7 @@ def download_gz_csv(url: str, label: str, comment_char: str | None = None) -> pd
     """Download a gzip-compressed CSV from SIFTS/EBI."""
     print(f"  Downloading {label} ...")
     try:
-        r = S.get(url, timeout=600, stream=True)
+        r = requests.get(url, headers=_HEADERS, timeout=600, stream=True)
         r.raise_for_status()
         buf = io.BytesIO(r.content)
         with gzip.open(buf) as gz:
@@ -95,20 +100,25 @@ def download_gz_csv(url: str, label: str, comment_char: str | None = None) -> pd
         return pd.DataFrame()
 
 
-def graphql(query: str, variables: dict | None = None) -> dict:
+def graphql(query: str, variables: dict | None = None, retries: int = 3) -> dict:
     payload = {"query": query}
     if variables:
         payload["variables"] = variables
-    try:
-        r = S.post(RCSB_GQL, json=payload, headers={"Content-Type": "application/json"}, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        if data.get("errors"):
-            print(f"    [warn] GraphQL errors: {data['errors'][:1]}")
-        return data.get("data", {})
-    except Exception as e:
-        print(f"    [warn] GraphQL: {e}")
-        return {}
+    for attempt in range(retries):
+        try:
+            r = requests.post(RCSB_GQL, json=payload, headers={**_HEADERS, "Content-Type": "application/json"},
+                               timeout=(10, 30))
+            r.raise_for_status()
+            data = r.json()
+            if data.get("errors"):
+                print(f"    [warn] GraphQL errors: {data['errors'][:1]}")
+            return data.get("data", {})
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"    [warn] GraphQL (giving up after {retries} attempts): {e}")
+                return {}
+            time.sleep(2 * (attempt + 1))
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +143,7 @@ query GetEntries($ids: [String!]!) {
       structure_determination_methodology
       polymer_entity_count_protein
       polymer_entity_count_nucleic_acid
+      assembly_count
     }
     refine {
       ls_R_factor_R_free
@@ -141,6 +152,22 @@ query GetEntries($ids: [String!]!) {
     }
     em_3d_reconstruction { resolution }
     pdbx_database_status { recvd_initial_deposition_date status_code }
+    cell { length_a length_b length_c angle_alpha angle_beta angle_gamma }
+    symmetry { space_group_name_H_M }
+    exptl_crystal_grow { pH temp method }
+    diffrn { ambient_temp }
+    diffrn_source { pdbx_wavelength }
+    rcsb_primary_citation {
+      title
+      rcsb_journal_abbrev
+      year
+      pdbx_database_id_DOI
+      pdbx_database_id_PubMed
+    }
+    polymer_entities {
+      entity_poly { pdbx_seq_one_letter_code_can rcsb_sample_sequence_length }
+      rcsb_entity_source_organism { ncbi_taxonomy_id scientific_name }
+    }
   }
 }
 """
@@ -155,6 +182,20 @@ def flatten_entry(entry: dict) -> dict:
     em0 = em[0] if em else {}
     status = entry.get("pdbx_database_status") or {}
     kw = entry.get("struct_keywords") or {}
+    cell = entry.get("cell") or {}
+    symmetry = entry.get("symmetry") or {}
+    grow = (entry.get("exptl_crystal_grow") or [{}])
+    grow0 = grow[0] if grow else {}
+    diffrn = (entry.get("diffrn") or [{}])
+    diffrn0 = diffrn[0] if diffrn else {}
+    diffrn_src = (entry.get("diffrn_source") or [{}])
+    diffrn_src0 = diffrn_src[0] if diffrn_src else {}
+    citation = entry.get("rcsb_primary_citation") or {}
+    entities = entry.get("polymer_entities") or []
+    first_entity = entities[0] if entities else {}
+    first_poly = (first_entity.get("entity_poly") or {})
+    first_organisms = first_entity.get("rcsb_entity_source_organism") or []
+    first_organism0 = first_organisms[0] if first_organisms else {}
     return {
         "pdb_id": entry.get("rcsb_id", ""),
         "title": (entry.get("struct") or {}).get("title", ""),
@@ -170,9 +211,32 @@ def flatten_entry(entry: dict) -> dict:
         "nonpolymer_instance_count": info.get("deposited_nonpolymer_entity_instance_count"),
         "protein_entity_count": info.get("polymer_entity_count_protein"),
         "nucleic_acid_entity_count": info.get("polymer_entity_count_nucleic_acid"),
+        "assembly_count": info.get("assembly_count"),
         "determination_methodology": info.get("structure_determination_methodology", ""),
         "deposition_date": status.get("recvd_initial_deposition_date", ""),
         "status_code": status.get("status_code", ""),
+        "cell_a": cell.get("length_a"),
+        "cell_b": cell.get("length_b"),
+        "cell_c": cell.get("length_c"),
+        "cell_alpha": cell.get("angle_alpha"),
+        "cell_beta": cell.get("angle_beta"),
+        "cell_gamma": cell.get("angle_gamma"),
+        "space_group": symmetry.get("space_group_name_H_M", ""),
+        "crystallization_pH": grow0.get("pH"),
+        "crystallization_temp_K": grow0.get("temp"),
+        "crystallization_method": grow0.get("method", ""),
+        "diffraction_ambient_temp_K": diffrn0.get("ambient_temp"),
+        "diffraction_wavelength_A": diffrn_src0.get("pdbx_wavelength"),
+        "citation_title": citation.get("title", ""),
+        "citation_journal": citation.get("rcsb_journal_abbrev", ""),
+        "citation_year": citation.get("year"),
+        "citation_doi": citation.get("pdbx_database_id_DOI", ""),
+        "citation_pubmed_id": citation.get("pdbx_database_id_PubMed"),
+        "polymer_entity_count": len(entities),
+        "primary_sequence": first_poly.get("pdbx_seq_one_letter_code_can", ""),
+        "primary_sequence_length": first_poly.get("rcsb_sample_sequence_length"),
+        "organism": first_organism0.get("scientific_name", ""),
+        "taxonomy_id": first_organism0.get("ncbi_taxonomy_id"),
     }
 
 
@@ -239,21 +303,26 @@ def step1_entry_index(out: Path) -> list[str]:
 
 
 def step2_entry_enrichment(out: Path, pdb_ids: list[str], batch_size: int = 50) -> None:
-    print(f"\n[2/4] Structural-method enrichment for {len(pdb_ids):,} entries via GraphQL ...")
+    print(f"\n[2/4] Structural-method enrichment for {len(pdb_ids):,} entries via GraphQL ...", flush=True)
     rows = []
-    for i in range(0, len(pdb_ids), batch_size):
+    dest = out / "pdb_entries_enriched.csv"
+    n_batches = (len(pdb_ids) + batch_size - 1) // batch_size
+    for batch_num, i in enumerate(range(0, len(pdb_ids), batch_size), 1):
         batch = pdb_ids[i : i + batch_size]
         data = graphql(ENTRY_ENRICH_GQL, {"ids": batch})
         for entry in data.get("entries") or []:
             if entry:
                 rows.append(flatten_entry(entry))
         done = min(i + batch_size, len(pdb_ids))
-        if done % 2000 < batch_size:
-            print(f"  Enrichment: {done:,}/{len(pdb_ids):,} ({len(rows):,} records)", end="\r")
+        if batch_num % 40 == 0 or done == len(pdb_ids):
+            print(f"  Enrichment: {done:,}/{len(pdb_ids):,} ({len(rows):,} records)", flush=True)
+        if batch_num % 400 == 0:
+            pd.DataFrame(rows).to_csv(dest, index=False)
+            print(f"    (checkpoint saved at {len(rows):,} rows)", flush=True)
         time.sleep(PAUSE)
-    print(f"  Enrichment: {len(rows):,} records fetched          ")
+    print(f"  Enrichment: {len(rows):,} records fetched", flush=True)
     df = pd.DataFrame(rows)
-    df.to_csv(out / "pdb_entries_enriched.csv", index=False)
+    df.to_csv(dest, index=False)
     print(f"  Saved {len(df):,} rows -> pdb_entries_enriched.csv")
 
 
