@@ -56,6 +56,15 @@ MAX_CHUNKS_PER_CSV = {
     # 870k ligand-instance rows, short per-row (numeric QC fields) — similar order to the
     # existing ~1M-row SIFTS files
     "twilight_ligands": 3_000,
+    # Round 3 sources
+    # 256k-entry validation summary, short per-row numeric QC fields — same shape as twilight
+    "wwpdb_validation": 3_000,
+    # 113k rows, richer per-row text (ligand name, target name, DOI) — similar order to CCD
+    "bindingdb_pdb_affinities": 5_000,
+    # top-3,000-accession interaction edges, short per-row — similar to the SIFTS mapping files
+    "string_interactions": 2_000,
+    # top-15,000-accession predictions, moderate per-row (gene, organism, confidence breakdown)
+    "alphafold_predictions": 5_000,
     # default cap for any CSV not listed above
     "__default__": 5_000,
 }

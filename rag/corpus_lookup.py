@@ -45,6 +45,10 @@ class CorpusFile:
     display_cols: list[str]
     subdir: str = "rcsb"
     case_insensitive: bool = True
+    # BindingDB's pdb_ids column holds a comma-separated list of PDB IDs per row (one binding
+    # measurement can be co-crystallized in several depositions) — an exact-match mask would never
+    # hit those rows, so this flags key_col for a split-and-contains match instead.
+    multi_value: bool = False
 
 
 # Registry of corpus files safe to load fully for exact-match lookup (all comfortably small).
@@ -93,6 +97,24 @@ REGISTRY: list[CorpusFile] = [
     CorpusFile("twilight_ligands.csv", "PDBID",
                ["LigNm", "ResNr", "RSCC", "OWAB", "Resol", "Rwork", "Rfree", "Valid"],
                subdir="twilight"),
+    # Round 3 sources: AlphaFold DB, BindingDB, wwPDB validation (via PDBe), STRING.
+    CorpusFile("alphafold_predictions.csv", "uniprot",
+               ["af_entry_id", "global_plddt", "fraction_plddt_very_low", "fraction_plddt_low",
+                "fraction_plddt_confident", "fraction_plddt_very_high", "sequence_length",
+                "model_created_date", "gene", "organism", "is_reviewed", "cif_url"],
+               subdir="alphafold", case_insensitive=False),
+    CorpusFile("bindingdb_pdb_affinities.csv", "pdb_ids",
+               ["ligand_name", "ligand_het_id", "target_name", "target_organism", "ki_nM",
+                "ic50_nM", "kd_nM", "ec50_nM", "assay_pH", "assay_temp_C", "article_doi", "pmid",
+                "uniprot_primary"],
+               subdir="bindingdb", multi_value=True),
+    CorpusFile("wwpdb_validation.csv", "pdb_id",
+               ["percent_rama_outliers", "percent_rama_outliers_percentile", "percent_rota_outliers",
+                "percent_rota_outliers_percentile", "clashscore", "clashscore_percentile"],
+               subdir="validation"),
+    CorpusFile("string_interactions.csv", "uniprot",
+               ["protein_name", "partner_name", "combined_score"],
+               subdir="string", case_insensitive=False),
 ]
 
 _cache: dict[str, pd.DataFrame] = {}
@@ -136,7 +158,15 @@ def lookup_id(entry_id: str) -> dict[str, list[dict]]:
         df = _load(cf)
         if df is None or cf.key_col not in df.columns:
             continue
-        if cf.case_insensitive:
+        if cf.multi_value:
+            needle = entry_id.lower() if cf.case_insensitive else entry_id
+            def _contains(cell: str, _needle=needle, _ci=cf.case_insensitive) -> bool:
+                parts = [p.strip() for p in cell.split(",")]
+                if _ci:
+                    parts = [p.lower() for p in parts]
+                return _needle in parts
+            mask = df[cf.key_col].apply(_contains)
+        elif cf.case_insensitive:
             mask = df[cf.key_col].str.lower() == entry_id.lower()
         else:
             mask = df[cf.key_col] == entry_id

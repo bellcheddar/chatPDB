@@ -5,15 +5,17 @@ MLX-LM expects a data directory containing `train.jsonl` and `valid.jsonl` (note
 
 ```
 data/
-├── corpus/            # RAG sources: RCSB/SIFTS/CATH/InterPro/Pharos/TWILIGHT/UniProt (gitignored, Phase 2 + corpus expansion)
+├── corpus/            # RAG sources: RCSB/SIFTS/CATH/InterPro/Pharos/TWILIGHT/UniProt/AlphaFold/
+│                        # BindingDB/wwPDB-validation/STRING (gitignored, Phase 2 + corpus expansion
+│                        # + round 3 sources, 2026-07-16)
 ├── structures/         # 820-file PDB-format sample, superseded by structures_all/ below but kept
 │                        # (small, fast for smoke-testing) — gitignored, scripts/download_structure_pool.py
 ├── structures_all/      # ALL 256,444 entries as native mmCIF, 353 GB (gitignored, "let's add ALL PDB
 │                         # files" round, 2026-07-16) — scripts/download_all_structures.py
-└── sft/               # SFT data (MLX --data directory), v2 populated 2026-07-16
-    ├── train.jsonl     # 40,187 examples
-    ├── valid.jsonl     # 5,023 examples
-    └── test.jsonl      # 5,023 examples, frozen, eval only
+└── sft/               # SFT data (MLX --data directory), v3 populated 2026-07-16
+    ├── train.jsonl     # 77,793 examples
+    ├── valid.jsonl     # 9,724 examples
+    └── test.jsonl      # 9,724 examples, frozen, eval only
 ```
 
 ## SFT format
@@ -71,15 +73,18 @@ prompt shortened here for readability, full text is in `config/system_prompt.txt
 | Version | Round | Examples | Rejection rate | Command | Notes |
 |---|---|---|---|---|---|
 | v1 | R1 | 45,502 (36,402 train) | 2.2% | `build_dataset.py --n 50000 --seed 51` | Target was 50,000; `tool_calling`'s two execution-verified generators (DSSP, NMR model count) were hard-capped by an 820-file structure pool, not padded. Superseded by v2. |
-| v2 | R2 | 50,233 (40,187 train) | 1.5% | `build_dataset.py --n 50000 --seed 51` (after "let's add ALL PDB files and ALL fields" — full mmCIF pool + expanded RCSB metadata) | Full 50,000 target hit; `tool_calling` reaches its complete 12,500 target for the first time (previously capped at 8,010) now that the structure pool is 256,444 files instead of 820. Added 4 new generators (citation, unit cell/space group, crystallization conditions, organism/taxonomy) from the expanded metadata pull. |
+| v2 | R2 | 50,233 (40,187 train) | 1.5% | `build_dataset.py --n 50000 --seed 51` (after "let's add ALL PDB files and ALL fields" — full mmCIF pool + expanded RCSB metadata) | Full 50,000 target hit; `tool_calling` reaches its complete 12,500 target for the first time (previously capped at 8,010) now that the structure pool is 256,444 files instead of 820. Added 4 new generators (citation, unit cell/space group, crystallization conditions, organism/taxonomy) from the expanded metadata pull. Superseded by v3. |
+| v3 | R3 | 97,241 (77,793 train) | 1.2% | `build_dataset.py --n 100000 --seed 51` (after "get AlphaFolddb, PDBbind/BindingDB, wwPDB validation reports, and STRING... make it all thorough") | 4 new corpus sources + ~19 new generators across multi-hop chains, bidirectional traversal, cross-database disagreement, missing-data honesty, comparative examples, tool-chaining, and RAG-shaped synthesis. Target doubled to 100,000 to match the larger generator roster; landed at 97,241 (97% of target) with the lowest rejection rate yet. |
 
-v2 class balance: `file_format_literacy` 12,500, `tool_calling` 12,500, `experimental_method`
-12,495, `database_cross_referencing` 11,738, `refusal_boundary` 1,000 (supplementary, not counted
-toward the four-class equal split).
+v3 class balance: `file_format_literacy` 25,000, `tool_calling` 24,993, `database_cross_referencing`
+23,769, `experimental_method` 22,500, `refusal_boundary` 1,000 (supplementary, not counted toward
+the four-class equal split).
 
-v2 token length (Qwen3-32B-4bit tokenizer, full chat-template-rendered example, n=2,000 sample):
-p50=550, p90=620, p95=638, p99=789, max=1,503 — comfortable margin under any `max_seq_length`
-chem_sage used (2048–3072); no examples needed truncation.
+v3 token length (Qwen3-32B-4bit tokenizer, full chat-template-rendered example, n=2,000 sample):
+p50=578, p90=704, p95=734, p99=940, max=1,969 — comfortable margin under any `max_seq_length`
+chem_sage used (2048–3072); no examples needed truncation. (For reference, v2: p50=550, p90=620,
+p95=638, p99=789, max=1,503 — v3's examples run somewhat longer on average, mainly the multi-hop-chain
+and RAG-synthesis generators, which cite several sources per answer.)
 
 **Comparison to chem_sage:** chem_sage grew its SFT dataset over 5 rounds — 1,500 (R1) → 5,000 (R3)
 → 8,000 (R4) → 20,000 (R5) examples. chatPDB's round 2 (50,233) is more than double chem_sage's
@@ -108,3 +113,98 @@ every 400 batches. Also found that mkdssp can still raise `Duplicate Key violati
 fraction of *native* mmCIF files straight from RCSB (not just legacy-PDB-converted ones) — the
 generator's existing oversample-and-skip tolerance absorbed this without needing a fix; DSSP still
 hit its full 2,500-example sub-target.
+
+**Round 3 (2026-07-16): "get AlphaFolddb, PDBbind/BindingDB, wwPDB validation reports, and STRING...
+make it all thorough as I want the best possible data before we start training."** Four new corpus
+sources plus six requested "techniques" layered on top: deeper multi-hop chains, bidirectional
+traversal, cross-database disagreement, comparative examples, tool-chaining skills, and RAG-shaped
+synthesis examples. This is explicitly pre-Phase-4 work — Phase 4 (QLoRA fine-tune) has still not
+started.
+
+**New corpus sources**, all downloaded and verified live before building generators against them:
+- `scripts/download_alphafold.py` — AlphaFold DB predicted structures for the top 15,000 UniProt
+  accessions by PDB cross-reference count (not all ~214M AlphaFold predictions — scoped to the
+  population this corpus can actually link to real experimental structures). **13,754 accessions**
+  pulled (some of the top 15,000 have no AlphaFold prediction available).
+- `scripts/download_bindingdb.py` — BindingDB's full bulk TSV (~9 GB, 3.2M+ measurements), streamed
+  and filtered down to rows whose PDB cross-reference field matches this corpus. **113,366 rows**
+  matched out of 3,228,554 scanned.
+- `scripts/download_wwpdb_validation.py` — PDBe's validation-report percentiles (Ramachandran
+  outliers, rotamer outliers, clashscore) for the full 256,448-entry corpus, 24 concurrent workers
+  (empirically tuned: 8→16→32 workers tested, ~98 req/s at 32, settled on 24 as a respectful pace).
+  **252,756 entries** returned validation data (3,672 had none available — mostly NMR/very old
+  entries the automated pipeline doesn't score the same way).
+- `scripts/download_string.py` — STRING protein-protein interaction edges, scoped to the top 3,000
+  human PDB-cross-referenced UniProt accessions (STRING's coverage is excellent for model organisms,
+  patchy elsewhere — covering human well beats covering everything thinly). **23,377 edges.**
+
+**Two real bugs in `download_string.py`**, both caught before generators were built against the
+data, not after: (1) an `IndexError` when an accession's `get_string_ids` response had only a header
+row (no match in STRING for that species) — fixed with a length check; (2) a more consequential
+correctness bug found only by manually inspecting sample output, not by an exception — STRING's
+`network` endpoint returns edges across a small interconnected *neighbourhood*, not a star graph
+centered on the query protein, so most raw edges didn't even mention the queried protein (a B2M
+query returned an "HLA-F, LILRB1" edge, neither of which is B2M). Fixed by resolving the query
+accession's STRING preferred name first, then filtering to edges that actually touch it.
+
+**~19 new generator functions** across all four classes implementing the requested techniques:
+- *Tool-chaining* (`tool_calling`): `gen_tool_chain_structure_analysis` (a single script combining
+  Biopython parsing and DSSP secondary-structure assignment, chained off one parsed structure object
+  rather than one call per fact) and `gen_tool_chain_lookup` (a real sequential API-lookup script:
+  SIFTS PDB→UniProt, then that UniProt accession chained into a Pharos druggability query).
+- *Comparative + new-source* (`experimental_method`): `gen_alphafold_vs_experimental` (the actual
+  predicted-vs-experimental contrast chatPDB's design thesis is built around, now backed by real
+  data on both sides — AlphaFold confidence chained through SIFTS to a real PDB entry's
+  resolution/R-free — instead of just a refusal), `gen_validation_geometry` (real Ramachandran/
+  rotamer/clashscore data with percentile context), `gen_multihop_structure_quality_full` (crystallo-
+  graphic fit and model geometry combined into one holistic assessment, explicit that they're
+  independent axes).
+- *Single-source new-data* (`database_cross_referencing`): `gen_binding_affinity` (BindingDB
+  potency), `gen_string_interactors` (STRING partners, aggregated per protein), `gen_alphafold_confidence`
+  (per-region pLDDT breakdown, standalone).
+- *Bidirectional traversal*: `gen_uniprot_to_pdb_aggregate` and `gen_ligand_to_pdb_aggregate` — the
+  reverse direction from every existing generator (which PDB entries does *this* UniProt accession
+  or *this* ligand appear in, not the other way round).
+- *Deeper multi-hop chains*: `gen_multihop_target_context` (PDB → SIFTS → Pharos → BindingDB, 4 hops),
+  `gen_multihop_ligand_quality_chain` (PDB → CCD/TWILIGHT pose-fit joined against BindingDB potency
+  for the same ligand), `gen_multihop_fold_function` (CATH fold classification joined with UniProt
+  function, explicit that fold correlates with but doesn't determine function).
+- *Cross-database disagreement / honesty*: `gen_cross_db_disagreement` (RCSB's and UniProt's organism
+  fields for the same chain don't always literally agree — teaches reporting both rather than
+  silently picking one) and `gen_missing_data_honesty` (entries with a genuinely absent R-free or
+  validation record get the correct "not available, here's why" answer, not a fabricated number —
+  the single most important refusal-adjacent behaviour for a database-grounded assistant).
+- *Comparative*: `gen_compare_two_entries` (two different PDB entries of the same UniProt accession,
+  compared head-to-head — "which structure should I use" needs two rows in context at once, which no
+  single-entry generator can answer).
+- *RAG-shaped synthesis*: `gen_rag_synthesis` — presents a prompt formatted like real retrieved RAG
+  context (numbered, source-tagged chunks from up to 4 different corpus files, shuffled) and requires
+  a synthesized, per-fact-cited answer. This trains the model for the shape it will actually see at
+  inference time behind the retriever, not just bare questions about pre-selected facts.
+
+**Bugs caught by smoke-testing before the full run** (2,000-example test runs at each fix, per this
+project's standing discipline — see `PROJECT_PLAN.md` §9): (1) `gen_validation_geometry` and
+`gen_multihop_structure_quality_full` only checked `clashscore.notna()`, missing that
+`percent_rama_outliers`/`percent_rota_outliers` can be independently NaN and that PDBe uses
+`clashscore == -1` as a sentinel for "not computed" — both now filter all three fields properly;
+(2) a pre-existing gap (present since round 1) in `gen_twilight_ligand_fit` and inherited by the new
+`gen_multihop_ligand_quality_chain`: TWILIGHT's `LigNm` field can be NaN, which rendered as the
+literal string "ligand nan bound in PDB entry..." in the generated *question* — `validate()` only
+ever checked the assistant's answer text, never the user's question, so this leaked straight through;
+both the generators (now filter `LigNm.notna()`) and `validate()` (now checks both message roles)
+were fixed; (3) the single most consequential bug: `gen_multihop_target_context`'s template literally
+contained the English phrase "none of which is recoverable" — `validate()`'s NaN/None leak check
+(a whitespace-split word match) correctly flagged every "none" appearing anywhere as a suspected
+leak, meaning **100% of this generator's output was silently rejected regardless of the data**,
+independent of a second, real, ~51%-of-rows issue where Pharos's `family` field is genuinely absent
+and was rendering as a literal "family nan" (present in `gen_pharos_druggability` since round 1 too,
+newly inherited by two round-3 generators). Fixed the template wording, added `pd.notna()` guards for
+`family` in all three affected generators, and hardened `validate()`'s leak check to a word-boundary
+regex (`\bnan\b`/`\bnone\b`) so "nanomolar" and similar real words don't false-positive while
+"nan%"/"nan,"/"(nan)" shapes still get caught.
+
+**Result: 97,241 examples** (77,793 train / 9,724 valid / 9,724 test) — up from v2's 50,233, on a
+target doubled to 100,000 to match the larger generator roster, landing at 97% of target with the
+lowest rejection rate of any round (1.2%, down from v2's 1.5%). `corpus_lookup.py`'s registry and the
+RAG corpus (now 22 files / 79,235 chunks, up from 18 / 65,811) were updated with all four new source
+files.

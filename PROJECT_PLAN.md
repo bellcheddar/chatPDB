@@ -9,12 +9,13 @@ reasons about structures that already exist, their provenance, and how to query 
 with real tools.
 
 **Author:** Marc C. Deller, D.Phil. ([marcdeller.com](https://marcdeller.com))
-**Status:** Phase 3 (SFT dataset) complete, round 2 (2026-07-16): full structure pool (256,444
-mmCIF files, 353 GB, every PDB entry) and expanded RCSB metadata (unit cell, space group,
-crystallization conditions, citation, sequence, taxonomy — all fields, not a subset). Base model:
-`mlx-community/Qwen3-32B-4bit`. RAG corpus: 18 files / 65,811 chunks. SFT dataset v2: 50,233
-examples (40,187 train / 5,023 valid / 5,023 test), full 50,000 target hit, `tool_calling` at its
-complete 12,500 target for the first time. More than double chem_sage's largest round (20,000, R5).
+**Status:** Phase 3 (SFT dataset) complete, round 3 (2026-07-16): four new corpus sources (AlphaFold
+DB, BindingDB, wwPDB validation reports, STRING) and ~19 new generators implementing deeper
+multi-hop chains, bidirectional traversal, cross-database disagreement, comparative examples,
+tool-chaining skills, and RAG-shaped synthesis examples. Base model: `mlx-community/Qwen3-32B-4bit`.
+RAG corpus: 22 files / 79,235 chunks. SFT dataset v3: 97,241 examples (77,793 train / 9,724 valid /
+9,724 test), target doubled to 100,000 to match the larger generator roster, landed at 97% with the
+lowest rejection rate yet (1.2%). Nearly 5x chem_sage's largest round (20,000, R5).
 Phase 4 (QLoRA fine-tune) not yet started.
 **Fine-tune stack:** MLX-LM on Apple Silicon (committed — same choice chem_sage validated over five
 rounds; see section 3).
@@ -121,16 +122,25 @@ Not a complete list — a starting map, organized by category, with the access m
 - **EMDB** — cryo-EM map metadata, resolution, FSC curves.
 - **wwPDB Chemical Component Dictionary (CCD) / BIRD** ✅ **implemented** — full 53,417-entry
   dictionary parsed from the bulk `components.cif.gz` with gemmi (Phase 2), not the drug-like subset.
-- **wwPDB validation reports** — still not directly reachable (RCSB GraphQL's `pdbx_vrpt_summary`
-  doesn't expose clashscore/Rama-outliers at entry level, confirmed by introspection). **TWILIGHT**
-  (ruppweb.org) ✅ **implemented** instead covers the ligand-fit half of this gap — per-ligand-
-  instance RSCC/OWAB density-quality scores, 870k rows (corpus expansion round, 2026-07-15/16).
-  The backbone-level validation metrics (Ramachandran, clashscore) remain unimplemented.
+- **wwPDB validation reports** ✅ **implemented** (`scripts/download_wwpdb_validation.py`, round 3) —
+  RCSB GraphQL's `pdbx_vrpt_summary` doesn't expose clashscore/Rama-outliers at entry level
+  (confirmed by introspection, Phase 2), but PDBe's `global-percentiles/entry` REST endpoint does:
+  Ramachandran outliers, rotamer outliers, and clashscore with percentile ranks, pulled for the full
+  256,448-entry corpus (24 concurrent workers, 252,756 entries returned data). **TWILIGHT**
+  (ruppweb.org) ✅ **implemented** (corpus expansion round) covers the complementary ligand-fit half
+  of structure QC — per-ligand-instance RSCC/OWAB density-quality scores, 870k rows. Together these
+  cover both halves of "is this a good structure": data-fit (resolution/R-free) and model-geometry
+  (Ramachandran/rotamer/clashscore) and ligand-pose-fit (RSCC).
 - **PDB-REDO** — re-refined/re-built X-ray structures; a good source of "what changed and why" pairs.
 
 ### Predicted / computational structures
-- **AlphaFold DB** (`alphafold.ebi.ac.uk`, bulk via Google Cloud/FTP, REST API) — per-UniProt
-  predicted structures with pLDDT/PAE.
+- **AlphaFold DB** ✅ **implemented** (`scripts/download_alphafold.py`, round 3) —
+  `alphafold.ebi.ac.uk` per-UniProt REST API (`/api/prediction/{accession}`), scoped to the top
+  15,000 UniProt accessions by PDB cross-reference count (not all ~214M AlphaFold predictions —
+  bulk FTP/GCS mirroring the full set isn't warranted when the goal is linking predictions to real
+  experimental structures this corpus already has). 13,754 accessions had a prediction available.
+  Global pLDDT, per-band confidence fractions (very-low/low/confident/very-high), and model metadata
+  pulled per entry.
 - **ESM Metagenomic Atlas** — large-scale predicted structures; useful as an explicit "predicted vs.
   experimentally determined" contrast case (this is where the "not a structure predictor" boundary
   gets trained in).
@@ -178,9 +188,14 @@ Not a complete list — a starting map, organized by category, with the access m
   count rather than all ~20k human targets.
 
 ### Ligand & binding data
-- **PDBbind** — measured binding affinities for protein-ligand complexes. chem_sage already has a
-  subset; chatPDB wants the *structural* side of the same data, not just affinity numbers.
-- **BindingDB** — broader affinity data cross-referenced to PDB entries.
+- **PDBbind** — measured binding affinities for protein-ligand complexes; largely superseded for
+  this project's purposes by the BindingDB pull below, which already cross-references PDB directly.
+  Not separately pursued.
+- **BindingDB** ✅ **implemented** (`scripts/download_bindingdb.py`, round 3) — bulk TSV download
+  (~9 GB uncompressed, 3.2M+ measurements), streamed row-by-row out of the zip (never loaded fully
+  into memory) and filtered to the 113,366 rows whose PDB cross-reference field matches this
+  corpus. Real measured Ki/IC50/Kd/EC50 potency data — the piece TWILIGHT's pose-fit RSCC doesn't
+  cover (a ligand can be perfectly modelled and still bind weakly, or vice versa).
 - **PLIP** — protein-ligand interaction fingerprints. This is a **tool**, not a corpus source: run at
   Phase 3 dataset-generation time, not downloaded in bulk.
 
@@ -194,7 +209,16 @@ Not a complete list — a starting map, organized by category, with the access m
 - **CASP** targets/results — structure-prediction benchmark history. Used as context/QA material
   ("what is CASP, how is prediction accuracy scored") — **never** as training signal for the model
   to attempt prediction itself.
-- **STRING** — protein-protein interaction network, cross-referenced to PDB structures.
+- **STRING** ✅ **implemented** (`scripts/download_string.py`, round 3) — protein-protein interaction
+  network. STRING's per-organism coverage is uneven (excellent for model organisms, patchy
+  elsewhere), so scoped to the top 3,000 human PDB-cross-referenced UniProt accessions (human has
+  both the deepest STRING coverage and the most PDB cross-references) rather than querying every
+  organism in the corpus thinly. 23,377 interaction edges, top 8 partners per protein by combined
+  confidence score. Two bugs found and fixed during the build: an `IndexError` on accessions with no
+  STRING mapping, and a correctness bug (caught by inspecting sample output, not an exception) where
+  the network endpoint returns edges across a small neighbourhood rather than a star graph centered
+  on the query protein — fixed by resolving the query's STRING preferred name and filtering to edges
+  that actually touch it.
 - **RCSB PDB-101 / Proteopedia** — plain-language educational explainers; a good source of
   well-written prose for the "explain this concept" behaviour class.
 
@@ -571,6 +595,46 @@ capped by the 820-file pool). Four new generators added from the expanded metada
 test), the original 50,000 target hit cleanly. `corpus_lookup.py`'s registry and the RAG corpus were
 also updated/re-ingested with the expanded `pdb_entries_enriched.csv` fields. Full narrative,
 class balance, and token stats in `data/README.md`'s v2 entry.
+
+**Round 3 (2026-07-16): "get AlphaFolddb, PDBbind/BindingDB, wwPDB validation reports, and STRING...
+make it all thorough as I want the best possible data before we start training."** Explicit
+pre-Phase-4 work: four new corpus sources (§4 above — AlphaFold DB, BindingDB, wwPDB validation,
+STRING, all ✅ implemented) plus six requested techniques implemented as ~19 new generator functions:
+tool-chaining scripts, deeper multi-hop chains (up to 4 hops: PDB→SIFTS→Pharos→BindingDB), bidirectional
+traversal (UniProt→PDB and ligand→PDB, reversing every existing generator's direction),
+cross-database disagreement + missing-data honesty, comparative entry-vs-entry examples, and a
+RAG-shaped multi-source synthesis generator that presents numbered, source-tagged context chunks and
+requires a cited answer — training the model for the shape it actually sees at inference time behind
+the retriever.
+
+Two classes of real bugs were caught by this project's standing smoke-test-before-full-run discipline
+(2,000-example runs, checked after every generator change): (1) NaN-handling gaps in the two new
+wwPDB-validation generators (PDBe uses `clashscore == -1` as an unchecked "not computed" sentinel,
+and `percent_rama_outliers`/`percent_rota_outliers` can be independently NaN) and a pre-existing gap
+inherited from round 1's `gen_twilight_ligand_fit` (TWILIGHT's `LigNm` can be NaN, leaking "ligand
+nan" into generated *questions* — `validate()` had only ever checked the assistant's answer text, not
+the user's question, so this had been silently leaking since round 1). (2) A more instructive bug:
+one new generator's template literally contained the word "none" in ordinary English ("...none of
+which is recoverable...") — `validate()`'s leak-detection check (matching the word "none" anywhere)
+correctly but overzealously flagged every single example that generator produced, silently rejecting
+100% of its real, valid output. Combined with a second, independent, ~51%-of-rows issue (Pharos's
+`family` field is genuinely absent for about half its targets, rendering as literal "family nan" in
+three generators, one of them present since round 1), this meant the affected generators were
+producing near-zero net yield despite generating correctly-grounded raw examples underneath — a
+sharp reminder that a validator with zero rejections isn't proof of correctness, and a validator
+rejecting *everything* from one generator is easy to miss in an aggregate rejection-rate number.
+Fixed the template wording, added `pd.notna()` guards throughout, and hardened `validate()` to a
+word-boundary regex checking both message roles.
+
+**Result: 97,241 examples** (77,793 train / 9,724 valid / 9,724 test) — target doubled to 100,000 to
+match the larger generator roster (database_cross_referencing alone grew from 9 to 21 generators),
+landing at 97% of target with the lowest rejection rate of any round (1.2%). The full run took
+~4.5 hours (execution-verified DSSP calls against the unfiltered 256k-file structure pool dominate —
+confirmed via `sample`-based process profiling that it was genuinely executing `mkdssp` subprocesses
+throughout, not hung; some structures in the full pool are far larger than round 1's size-capped
+sample). `corpus_lookup.py`'s registry and the RAG corpus (now 22 files / 79,235 chunks, up from
+18 / 65,811) were updated with all four new source files. Full narrative, class balance, and token
+stats in `data/README.md`'s v3 entry.
 
 ### Phase 4 — QLoRA fine-tune with MLX-LM (0.5–1 day of compute)
 `config/train_config.yaml` seeded from chem_sage's validated field names and values (rank, RSLoRA,

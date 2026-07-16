@@ -70,6 +70,18 @@ def load_corpus() -> dict:
     c["twilight"] = pd.read_csv(CORPUS / "twilight/twilight_ligands.csv", low_memory=False)
     c["uniprot"] = pd.read_csv(CORPUS / "uniprot/uniprot_entries.csv")
 
+    # Round 3 sources: AlphaFold DB, BindingDB, wwPDB validation (via PDBe), STRING.
+    def _read_optional(path: Path, **kwargs) -> pd.DataFrame:
+        if not path.exists():
+            print(f"  [warn] {path} not found — its generators will be skipped this run")
+            return pd.DataFrame()
+        return pd.read_csv(path, **kwargs)
+
+    c["alphafold"] = _read_optional(CORPUS / "alphafold/alphafold_predictions.csv")
+    c["bindingdb"] = _read_optional(CORPUS / "bindingdb/bindingdb_pdb_affinities.csv", low_memory=False)
+    c["validation"] = _read_optional(CORPUS / "validation/wwpdb_validation.csv")
+    c["string"] = _read_optional(CORPUS / "string/string_interactions.csv")
+
     # CATH domain -> classification join, keyed by PDB id + chain (mirrors rag/corpus_lookup.py's
     # two-hop join, precomputed here once for speed across thousands of generated examples).
     # sifts_pdb_cath.csv columns: PDB, CHAIN, SP_PRIMARY, CATH_ID (confirmed live 2026-07-15).
@@ -122,8 +134,15 @@ def validate(ex: dict, valid_pdb_ids: set[str], valid_comp_ids: set[str], valid_
     user, assistant = ex["messages"][1]["content"], ex["messages"][2]["content"]
     if len(user) < 10 or len(assistant) < 20:
         return False
-    if "nan" in assistant.lower().split() or "none" in assistant.lower().replace(".", " ").split():
-        return False
+    # Word-boundary regex rather than a whitespace split: catches "nan%" / "nan," / "(nan)" too,
+    # not just a bare "nan" token — the split-based check missed exactly this shape of leak
+    # (round 3: gen_multihop_structure_quality_full rendering "nan% Ramachandran outliers").
+    # Checks the user text too, not just the assistant: a NaN field (e.g. TWILIGHT's LigNm) can
+    # leak into a generated *question* just as easily as an answer (round 3: "ligand nan bound
+    # in PDB entry ...", caught here after the raw generator filters were also fixed at source).
+    for text in (user, assistant):
+        if re.search(r"\bnan\b", text, re.IGNORECASE) or re.search(r"\bnone\b", text, re.IGNORECASE):
+            return False
     for block in re.findall(r"```python\n(.*?)```", assistant, re.DOTALL):
         if not compiles(block):
             return False
@@ -350,7 +369,7 @@ def gen_nmr_characteristics(df: pd.DataFrame, rng: random.Random, n: int) -> lis
 
 
 def gen_twilight_ligand_fit(df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
-    rows = df[df["RSCC"].notna()].copy()
+    rows = df[df["RSCC"].notna() & df["LigNm"].notna()].copy()
     rows["RSCC"] = pd.to_numeric(rows["RSCC"], errors="coerce")
     rows = rows[rows["RSCC"].between(-1.5, 1.0)].sample(n=min(n, len(rows)), random_state=rng.randint(0, 1 << 30))
     out = []
@@ -418,6 +437,119 @@ def gen_crystallization_conditions(df: pd.DataFrame, rng: random.Random, n: int)
             f"conformational or protonation state was captured, and the diffraction wavelength (often "
             f"a synchrotron-tunable value, not always the lab Cu-Kα 1.5418 Å) matters for anomalous "
             f"scattering experiments and resolution limits achievable."
+        )
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
+def gen_validation_geometry(validation_df: pd.DataFrame, entries_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """wwPDB validation report data (Ramachandran/rotamer outliers, clashscore) — the backbone-
+    geometry half of the "structure QC" gap TWILIGHT's ligand-density data didn't cover. Percentile
+    ranks (against all PDB entries of comparable resolution) are what a structural biologist
+    actually means by "is this clashscore good", not the raw number alone."""
+    if validation_df.empty:
+        return []
+    # clashscore == -1 is PDBe's sentinel for "not computed" (e.g. no hydrogens placed), and
+    # percent_rama_outliers/percent_rota_outliers can each be independently NaN even when
+    # clashscore is present — checking clashscore alone let "nan%" leak into rendered examples.
+    valid = validation_df[
+        validation_df["clashscore"].notna() & (validation_df["clashscore"] >= 0) &
+        validation_df["percent_rama_outliers"].notna() & validation_df["percent_rota_outliers"].notna()
+    ]
+    if valid.empty:
+        return []
+    rows = valid.sample(n=min(n, len(valid)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"What do the wwPDB validation metrics (Ramachandran outliers, rotamer outliers, clashscore) look like for PDB entry {r['pdb_id']}?"
+        clash_pct = r.get("clashscore_percentile")
+        clash_read = (f"better than {clash_pct:.0f}% of comparable-resolution structures" if pd.notna(clash_pct)
+                      else "percentile rank not available")
+        a = (
+            f"Entry {r['pdb_id']}: {r['percent_rama_outliers']:.2f}% Ramachandran outliers, "
+            f"{r['percent_rota_outliers']:.2f}% rotamer outliers, clashscore {r['clashscore']:.2f} "
+            f"({clash_read}, per wwPDB's percentile ranking against structures of comparable "
+            f"resolution). These are the backbone/side-chain geometry checks in the entry's official "
+            f"validation report — independent of resolution and R-free, which describe how well the "
+            f"model fits the diffraction data, not whether the model's own stereochemistry is sound. "
+            f"A structure can have excellent resolution and still have geometry outliers, or vice "
+            f"versa; check both."
+        )
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
+def gen_alphafold_vs_experimental(alphafold_df: pd.DataFrame, entries_df: pd.DataFrame,
+                                   sifts_uniprot_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Comparative + new-source: the actual "predicted vs experimental" contrast chatPDB's whole
+    design thesis is built around, now backed by real data on both sides instead of just a refusal.
+    Chain: AlphaFold (predicted confidence) <- UniProt accession -> SIFTS -> PDB entry (experimental
+    resolution/R-free)."""
+    if alphafold_df.empty:
+        return []
+    merged = alphafold_df.merge(sifts_uniprot_df, left_on="uniprot", right_on="SP_PRIMARY", how="inner")
+    merged = merged.merge(entries_df[["pdb_id", "resolution_A", "r_free", "method"]],
+                           left_on="PDB", right_on="pdb_id", how="inner")
+    merged = merged[merged["resolution_A"].notna() & merged["global_plddt"].notna()]
+    if merged.empty:
+        return []
+    rows = merged.sample(n=min(n, len(merged)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        plddt = float(r["global_plddt"])
+        conf = ("very high confidence" if plddt >= 90 else "confident" if plddt >= 70 else
+                "low confidence" if plddt >= 50 else "very low confidence — likely disordered or poorly predicted")
+        q = (f"UniProt {r['uniprot']} has both an AlphaFold predicted model (confidence {plddt:.1f}) and a real "
+             f"experimental structure, PDB entry {r['pdb_id']} (resolution {r['resolution_A']:.2f} Å, "
+             f"{r['method']}). Which should I trust, and for what?")
+        a = (
+            f"For this specific protein, prefer the experimental structure ({r['pdb_id']}, "
+            f"{r['resolution_A']:.2f} Å) wherever it covers what you need — it reflects a real, "
+            f"measured conformation, not a statistical prediction, and at this resolution "
+            f"{_resolution_bucket(float(r['resolution_A']))}. AlphaFold's predicted model "
+            f"(confidence {plddt:.1f}/100, {conf}) is most useful for the parts of the protein the "
+            f"experimental structure *doesn't* cover — crystal constructs are often truncated, "
+            f"missing flexible loops, or a single domain of a larger protein — or as a fast first "
+            f"look before an experimental structure exists at all. A high AlphaFold confidence score "
+            f"is not evidence the prediction is *correct* for functionally important conformational "
+            f"states (ligand-bound, alternate conformers); it reflects how consistently the model "
+            f"predicts the same local structure, which usually but not always tracks with accuracy."
+        )
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
+def gen_multihop_structure_quality_full(entries_df: pd.DataFrame, validation_df: pd.DataFrame,
+                                         rng: random.Random, n: int) -> list[dict]:
+    """3-hop: resolution/R-free (crystallographic fit) + Ramachandran/rotamer/clashscore (model
+    geometry) combined into one holistic quality assessment — the two halves of "is this a good
+    structure" that no single existing generator combined."""
+    if validation_df.empty:
+        return []
+    merged = entries_df.merge(validation_df, on="pdb_id", how="inner")
+    # Same sentinel/independent-NaN issue as gen_validation_geometry: clashscore == -1 means "not
+    # computed", and percent_rama_outliers/percent_rota_outliers can be NaN independently of it.
+    merged = merged[
+        merged["resolution_A"].notna() & merged["clashscore"].notna() & (merged["clashscore"] >= 0) &
+        merged["percent_rama_outliers"].notna() & merged["percent_rota_outliers"].notna()
+    ]
+    if merged.empty:
+        return []
+    rows = merged.sample(n=min(n, len(merged)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"Give a full quality assessment of PDB entry {r['pdb_id']}, combining both crystallographic and model-geometry metrics."
+        rfree_line = (f" R-free is {float(r['r_free']):.3f} ({_rfree_bucket(float(r['r_free']))})."
+                      if pd.notna(r.get("r_free")) else "")
+        a = (
+            f"{r['pdb_id']} at {float(r['resolution_A']):.2f} Å is {_resolution_bucket(float(r['resolution_A']))}."
+            f"{rfree_line} On model geometry: {r['percent_rama_outliers']:.2f}% Ramachandran outliers, "
+            f"{r['percent_rota_outliers']:.2f}% rotamer outliers, clashscore {r['clashscore']:.2f}. "
+            f"These two assessments are independent: resolution/R-free describe how well the model "
+            f"explains the *experimental data*, while Ramachandran/rotamer/clashscore describe "
+            f"whether the model's own *stereochemistry* is physically reasonable, regardless of the "
+            f"data. A trustworthy structure should look reasonable on both axes — good data-fit "
+            f"metrics don't excuse a geometrically implausible model, and vice versa."
         )
         out.append(make_example(q, a, "experimental_method"))
     return out
@@ -588,6 +720,92 @@ def gen_nmr_model_count(structure_files: list[Path], entries_df: pd.DataFrame, r
     return out
 
 
+def gen_tool_chain_structure_analysis(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Tool-chaining skill: a single coherent script performing two sequential real computations
+    (parse -> count, then DSSP -> secondary structure) rather than one call per example. This is
+    the compositional pattern real usage needs — a user rarely wants exactly one fact, they want a
+    short analysis — and the earlier single-purpose generators never modelled a multi-step script."""
+    out = []
+    sample = rng.sample(structure_files, k=min(n * 2, len(structure_files)))
+    for path in sample:
+        if len(out) >= n:
+            break
+        pid = path.stem.upper()
+        try:
+            from Bio.PDB import MMCIFParser
+            structure = MMCIFParser(QUIET=True).get_structure(pid, str(path))
+            model = structure[0]
+            n_chains = len(list(model.get_chains()))
+            n_atoms = sum(1 for _ in model.get_atoms())
+        except Exception:
+            continue
+        counts = _run_dssp_mmcif(path)
+        if not counts:
+            continue
+        helix = counts.get("H", 0) + counts.get("G", 0) + counts.get("I", 0)
+        strand = counts.get("E", 0) + counts.get("B", 0)
+        q = f"Give me a quick structural summary of PDB entry {pid} (mmCIF file `{path.name}`): chain/atom counts and secondary structure content, in one script."
+        a = (
+            "```python\n"
+            "from Bio.PDB import MMCIFParser\n"
+            "from Bio.PDB.DSSP import DSSP\n\n"
+            f"structure = MMCIFParser(QUIET=True).get_structure('{pid}', '{path.name}')\n"
+            "model = structure[0]\n\n"
+            "# Step 1: basic composition\n"
+            "n_chains = len(list(model.get_chains()))\n"
+            "n_atoms = sum(1 for _ in model.get_atoms())\n"
+            "print(f'Chains: {n_chains}, Atoms: {n_atoms}')\n\n"
+            "# Step 2: secondary structure, chained off the same parsed model\n"
+            f"dssp = DSSP(model, '{path.name}', dssp='mkdssp', file_type='mmCIF')\n"
+            "ss_counts = {}\n"
+            "for key in dssp.keys():\n"
+            "    ss_counts[dssp[key][2]] = ss_counts.get(dssp[key][2], 0) + 1\n"
+            "print('Secondary structure:', ss_counts)\n"
+            "```\n\n"
+            f"For {pid}: {n_chains} chain(s), {n_atoms:,} atoms; DSSP assigns {helix} helical and "
+            f"{strand} strand residues — {'predominantly helical' if helix > strand * 1.5 else 'predominantly beta' if strand > helix * 1.5 else 'mixed alpha/beta'}. "
+            f"Chaining the two steps off the same parsed `model` object avoids re-parsing the file."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_tool_chain_lookup(sifts_uniprot_df: pd.DataFrame, pharos_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Tool-chaining skill, API version: a real multi-step lookup script (SIFTS -> UniProt ->
+    Pharos), the actual sequential pattern a live RAG+tool-exec agent needs for "is this a
+    validated target" style questions that no single API answers alone. Expected output values are
+    the real, already-verified corpus facts for that PDB/UniProt pair, not invented."""
+    merged = pharos_df.merge(sifts_uniprot_df, left_on="uniprot", right_on="SP_PRIMARY", how="inner")
+    if merged.empty:
+        return []
+    rows = merged.sample(n=min(n, len(merged)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"For PDB entry {r['PDB'].upper()}, chain {r['CHAIN']}: find its UniProt mapping, then check whether that target is druggable per Pharos. Show the full lookup chain."
+        a = (
+            "```python\n"
+            "import requests\n\n"
+            f"pdb_id, chain = '{r['PDB'].upper()}', '{r['CHAIN']}'\n\n"
+            "# Step 1: PDB chain -> UniProt accession, via SIFTS (PDBe's cross-reference API)\n"
+            "sifts = requests.get(f'https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/{pdb_id}').json()\n"
+            "uniprot_acc = list(sifts[pdb_id.lower()]['UniProt'].keys())[0]\n"
+            "print('UniProt:', uniprot_acc)\n\n"
+            "# Step 2: chain the UniProt accession into a Pharos GraphQL query for target development level\n"
+            "query = '{ target(q: {uniprot: \"%s\"}) { name tdl fam } }' % uniprot_acc\n"
+            "pharos = requests.post('https://pharos-api.ncats.io/graphql', json={'query': query}).json()\n"
+            "print(pharos['data']['target'])\n"
+            "```\n\n"
+            f"For {r['PDB'].upper()} chain {r['CHAIN']}: SIFTS resolves UniProt {r['uniprot']}, and "
+            f"Pharos reports it as {r['name']} ({r['symbol']}), target development level {r['tdl']}"
+            + (f", family {r['family']}." if pd.notna(r.get("family")) else " (no Pharos family assigned).")
+            + " This two-step chain — structural cross-reference, then external "
+            f"pharmacology lookup — is the actual pattern for answering 'is this a real drug target' "
+            f"from a bare PDB ID; neither API alone has both pieces."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Class 4: database_cross_referencing
 # ---------------------------------------------------------------------------
@@ -700,9 +918,13 @@ def gen_pharos_druggability(pharos_df: pd.DataFrame, sifts_uniprot_df: pd.DataFr
         q = f"How well studied is the drug target behind chain {r['CHAIN']} of PDB entry {r['PDB'].upper()} (UniProt {r['uniprot']})?"
         a = (
             f"UniProt {r['uniprot']} ({r['name']}, gene {r['symbol']}) has Pharos target development "
-            f"level {r['tdl']} — {tdl_meaning.get(r['tdl'], 'development status not further characterised')}. "
-            f"It's classified in the {r['family']} target family."
+            f"level {r['tdl']} — {tdl_meaning.get(r['tdl'], 'development status not further characterised')}."
         )
+        # ~51% of Pharos rows have no 'family' assigned — render that as an explicit statement
+        # rather than an f-string "nan" leak (Pharos itself simply doesn't classify every target
+        # into one of its named families, most often for Tdark/understudied entries).
+        a += (f" It's classified in the {r['family']} target family." if pd.notna(r.get("family"))
+              else " Pharos doesn't assign this target to one of its named families.")
         if pd.notna(r.get("top_diseases")) and r["top_diseases"]:
             diseases = str(r["top_diseases"]).split("|")[:3]
             a += f" Associated conditions include: {', '.join(d.strip() for d in diseases)}."
@@ -770,6 +992,479 @@ def gen_organism_taxonomy(df: pd.DataFrame, rng: random.Random, n: int) -> list[
     return out
 
 
+# --- Round 3: single-source generators for the four new corpus files -------
+
+def gen_binding_affinity(bindingdb_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Single-source, new data: real measured potency (Ki/IC50/Kd/EC50) — the piece TWILIGHT's
+    pose-fit RSCC data doesn't cover. A ligand can be perfectly modelled and still bind weakly, or
+    fit poorly in density yet be a genuinely potent inhibitor captured at partial occupancy."""
+    if bindingdb_df.empty:
+        return []
+    df = bindingdb_df.copy()
+    df["pdb_ids"] = df["pdb_ids"].astype(str)
+    df = df.assign(pdb_id=df["pdb_ids"].str.split(",")).explode("pdb_id")
+    df["pdb_id"] = df["pdb_id"].str.strip().str.upper()
+    affinity_cols = ["ki_nM", "ic50_nM", "kd_nM", "ec50_nM"]
+    for col in affinity_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df[df[affinity_cols].notna().any(axis=1) & (df["pdb_id"] != "") & df["ligand_name"].notna()]
+    if df.empty:
+        return []
+    rows = df.sample(n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        measured = [(label, r[col]) for label, col in
+                    [("Ki", "ki_nM"), ("IC50", "ic50_nM"), ("Kd", "kd_nM"), ("EC50", "ec50_nM")]
+                    if pd.notna(r[col])]
+        label, value = measured[0]
+        potency = ("sub-nanomolar, very high potency" if value < 1 else
+                   "low nanomolar, high potency" if value < 100 else
+                   "high nanomolar to low micromolar, moderate potency" if value < 10000 else
+                   "weak/micromolar+, low potency")
+        ligand_short = str(r["ligand_name"]).split("::")[0][:80]
+        q = f"How potent is the ligand bound in PDB entry {r['pdb_id']} ({ligand_short}) against its target?"
+        a = (
+            f"BindingDB reports {label} = {value:g} nM for this ligand-target pair "
+            f"({r['target_name']}, {r['target_organism']}) — {potency}."
+        )
+        if pd.notna(r.get("article_doi")) and r["article_doi"]:
+            a += f" Source: DOI {r['article_doi']}."
+        a += (
+            f" This is a measured solution-phase binding affinity, not derived from the crystal "
+            f"structure itself — {r['pdb_id']} shows *how* the ligand binds (the pose), BindingDB's "
+            f"assay data shows *how tightly*. A co-crystal structure alone is not proof of potency: "
+            f"weak or even non-functional binders can still be captured at high ligand concentration "
+            f"in a crystallization soak."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_string_interactors(string_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Single-source, new data: real protein-protein interaction partners, aggregated per protein —
+    STRING's data arrives one edge per row, so this groups by query protein first."""
+    if string_df.empty:
+        return []
+    grouped = string_df.groupby(["uniprot", "protein_name"])
+    keys = list(grouped.groups.keys())
+    if not keys:
+        return []
+    sample_keys = rng.sample(keys, k=min(n, len(keys)))
+    out = []
+    for uniprot, name in sample_keys:
+        g = grouped.get_group((uniprot, name)).sort_values("combined_score", ascending=False)
+        partners = [f"{row['partner_name']} (score {row['combined_score']:.2f})" for _, row in g.head(5).iterrows()]
+        q = f"What proteins does {name} (UniProt {uniprot}) interact with, per STRING?"
+        a = (
+            f"STRING's top interaction partners for {name} ({uniprot}), ranked by combined confidence "
+            f"score (0-1, combining evidence from experiments, curated databases, co-expression, and "
+            f"text mining): {', '.join(partners)}. A high combined score reflects strong aggregate "
+            f"evidence across STRING's channels, not necessarily a direct physical interaction "
+            f"confirmed structurally — for that, check whether a co-crystal or cryo-EM complex "
+            f"structure of the pair exists in the PDB."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_alphafold_confidence(alphafold_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Single-source, new data: per-region pLDDT confidence breakdown, standalone (companion to the
+    comparative gen_alphafold_vs_experimental generator, this one needs no linked PDB entry, so it
+    covers UniProt accessions the experimental corpus has no structure for at all)."""
+    if alphafold_df.empty:
+        return []
+    df = alphafold_df[alphafold_df["global_plddt"].notna()]
+    rows = df.sample(n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        plddt = float(r["global_plddt"])
+        conf = ("very high" if plddt >= 90 else "confident" if plddt >= 70 else
+                "low" if plddt >= 50 else "very low")
+        gene = r.get("gene") if pd.notna(r.get("gene")) and r.get("gene") else "gene not recorded"
+        organism = r.get("organism") if pd.notna(r.get("organism")) and r.get("organism") else "organism not recorded"
+        q = f"How reliable is the AlphaFold predicted structure for UniProt {r['uniprot']} ({gene}, {organism})?"
+        very_high = float(r["fraction_plddt_very_high"]) * 100 if pd.notna(r.get("fraction_plddt_very_high")) else None
+        very_low = float(r["fraction_plddt_very_low"]) * 100 if pd.notna(r.get("fraction_plddt_very_low")) else None
+        a = f"Global mean pLDDT is {plddt:.1f}/100 — {conf} confidence overall."
+        if very_high is not None and very_low is not None:
+            a += (f" {very_high:.0f}% of residues fall in the very-high-confidence band (pLDDT>90), "
+                  f"vs {very_low:.0f}% very-low-confidence (pLDDT<50) — the latter typically "
+                  f"corresponds to intrinsically disordered regions or poorly conserved loops that "
+                  f"AlphaFold isn't expected to predict a single fixed structure for, since one may "
+                  f"not exist biologically.")
+        a += (" Treat pLDDT per-residue rather than trusting the global average alone: a protein can "
+              "have a high mean score driven by a well-folded core domain while a terminal tail or "
+              "linker is confidently flagged as disordered (correctly) at very low pLDDT.")
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+# --- Round 3: bidirectional traversal ---------------------------------------
+
+def gen_uniprot_to_pdb_aggregate(sifts_uniprot_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Bidirectional traversal: the usual direction in this corpus is PDB -> UniProt (one chain, one
+    lookup); this reverses it — given a UniProt accession, aggregate every PDB entry that maps to
+    it. A well-studied target often has dozens of deposited structures (different ligands, space
+    groups, resolutions), and 'which structures exist for protein X' is a distinct, common real
+    question the forward direction alone can't answer."""
+    counts = sifts_uniprot_df.groupby("SP_PRIMARY")["PDB"].nunique()
+    multi = counts[counts >= 3]
+    if multi.empty:
+        return []
+    accs = rng.sample(list(multi.index), k=min(n, len(multi)))
+    out = []
+    for acc in accs:
+        entries = sorted(sifts_uniprot_df[sifts_uniprot_df["SP_PRIMARY"] == acc]["PDB"].str.upper().unique())
+        shown = entries[:10]
+        q = f"Which PDB entries are structures of the protein with UniProt accession {acc}?"
+        a = (
+            f"UniProt {acc} maps (via SIFTS) to {len(entries)} PDB entries in this corpus, including "
+            f"{', '.join(shown)}" + (" and others" if len(entries) > 10 else "") + ". Multiple entries "
+            f"for the same protein are normal and often valuable to compare: different entries may "
+            f"capture different ligands bound, different crystal forms, different resolutions, or "
+            f"structures solved years apart with improved refinement — the 'best' one to use depends "
+            f"on what you're asking (highest resolution for geometric detail, a specific ligand-bound "
+            f"form for a binding-site question, etc.), not just whichever comes up first."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_ligand_to_pdb_aggregate(twilight_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Bidirectional traversal, ligand direction: given a ligand name, aggregate every PDB entry it
+    appears in — the reverse of the usual 'this entry contains ligand X' direction."""
+    df = twilight_df[twilight_df["LigNm"].notna() & (twilight_df["LigNm"] != "")]
+    counts = df.groupby("LigNm")["PDBID"].nunique()
+    multi = counts[counts >= 5]
+    if multi.empty:
+        return []
+    ligands = rng.sample(list(multi.index), k=min(n, len(multi)))
+    out = []
+    for lig in ligands:
+        entries = sorted(df[df["LigNm"] == lig]["PDBID"].str.upper().unique())
+        shown = entries[:10]
+        q = f"Which PDB entries contain the ligand '{lig}'?"
+        a = (
+            f"'{lig}' appears in {len(entries)} PDB entries in this corpus, including "
+            f"{', '.join(shown)}" + (" and others" if len(entries) > 10 else "") + ". A ligand "
+            f"appearing across many entries usually means it's either a common crystallization "
+            f"additive/cryoprotectant (if chemically simple) or a biologically important cofactor/"
+            f"inhibitor studied across many structural contexts (different targets, or the same "
+            f"target's different constructs/mutants) — check the ligand identity and target "
+            f"diversity together before assuming which case applies."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+# --- Round 3: deeper multi-hop chains ---------------------------------------
+
+def gen_multihop_target_context(entries_df: pd.DataFrame, sifts_uniprot_df: pd.DataFrame,
+                                 pharos_df: pd.DataFrame, bindingdb_df: pd.DataFrame,
+                                 rng: random.Random, n: int) -> list[dict]:
+    """4-hop chain: PDB entry -> UniProt (SIFTS) -> Pharos (target druggability) -> BindingDB
+    (measured potency for that same target). Answers 'give me the full target-context picture for
+    this structure', which needs all three external databases chained off one starting PDB ID."""
+    if pharos_df.empty or bindingdb_df.empty:
+        return []
+    m = sifts_uniprot_df.merge(pharos_df, left_on="SP_PRIMARY", right_on="uniprot", how="inner")
+    bdf = bindingdb_df[bindingdb_df["uniprot_primary"].notna()].copy()
+    m = m.merge(bdf, left_on="SP_PRIMARY", right_on="uniprot_primary", how="inner")
+    m["pdb_id"] = m["PDB"].str.upper()
+    m = m.merge(entries_df[["pdb_id", "resolution_A", "method"]], on="pdb_id", how="inner")
+    affinity_cols = ["ki_nM", "ic50_nM", "kd_nM", "ec50_nM"]
+    for col in affinity_cols:
+        m[col] = pd.to_numeric(m[col], errors="coerce")
+    m = m[m[affinity_cols].notna().any(axis=1) & m["resolution_A"].notna()]
+    if m.empty:
+        return []
+    rows = m.sample(n=min(n, len(m)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        measured = [(label, r[col]) for label, col in
+                    [("Ki", "ki_nM"), ("IC50", "ic50_nM"), ("Kd", "kd_nM"), ("EC50", "ec50_nM")]
+                    if pd.notna(r[col])]
+        if not measured:
+            continue
+        label, value = measured[0]
+        q = f"I have PDB entry {r['pdb_id']}. Walk me through its target's biology and druggability, chaining through every database you can."
+        family_part = f", family {r['family']}" if pd.notna(r.get("family")) else ""
+        a = (
+            f"Chain: {r['pdb_id']} ({r['method']}, {float(r['resolution_A']):.2f} Å) -> SIFTS maps "
+            f"chain {r['CHAIN']} to UniProt {r['SP_PRIMARY']} -> Pharos classifies that target as "
+            f"{r['name']} ({r['symbol']}), development level {r['tdl']}{family_part} -> "
+            f"BindingDB has a measured {label} of {value:g} nM against this target for the ligand "
+            f"{str(r['ligand_name']).split('::')[0][:60]}. Together this tells you not just what the "
+            f"structure looks like, but how pharmacologically mature the target is and how potent a "
+            f"real measured inhibitor of it is — context you can't recover from the structure file "
+            f"alone."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_multihop_ligand_quality_chain(twilight_df: pd.DataFrame, bindingdb_df: pd.DataFrame,
+                                       rng: random.Random, n: int) -> list[dict]:
+    """3-hop chain: PDB entry -> ligand identity (CCD/TWILIGHT) -> model-fit quality (RSCC), joined
+    against -> measured potency (BindingDB) for that same PDB+ligand pair. Deliberately keeps the
+    two halves separate in the answer — pose quality and binding potency are uncorrelated axes, and
+    conflating them is a common real mistake."""
+    if bindingdb_df.empty:
+        return []
+    tw = twilight_df[twilight_df["RSCC"].notna() & twilight_df["LigNm"].notna()].copy()
+    tw["RSCC"] = pd.to_numeric(tw["RSCC"], errors="coerce")
+    tw["pdb_id"] = tw["PDBID"].str.upper()
+    tw["ligand_key"] = tw["LigNm"].astype(str).str.upper()
+    bdf = bindingdb_df.copy()
+    bdf["pdb_ids"] = bdf["pdb_ids"].astype(str)
+    bdf = bdf.assign(pdb_id=bdf["pdb_ids"].str.split(",")).explode("pdb_id")
+    bdf["pdb_id"] = bdf["pdb_id"].str.strip().str.upper()
+    bdf["ligand_key"] = bdf["ligand_het_id"].astype(str).str.upper()
+    m = tw.merge(bdf, on=["pdb_id", "ligand_key"], how="inner")
+    affinity_cols = ["ki_nM", "ic50_nM", "kd_nM", "ec50_nM"]
+    for col in affinity_cols:
+        m[col] = pd.to_numeric(m[col], errors="coerce")
+    m = m[m[affinity_cols].notna().any(axis=1) & m["RSCC"].between(-1.5, 1.0)]
+    if m.empty:
+        return []
+    rows = m.sample(n=min(n, len(m)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        rscc = float(r["RSCC"])
+        fit = ("an excellent fit to the density" if rscc > 0.9 else
+               "a reasonable fit" if rscc > 0.8 else "a poor fit to the density")
+        measured = [(label, r[col]) for label, col in
+                    [("Ki", "ki_nM"), ("IC50", "ic50_nM"), ("Kd", "kd_nM"), ("EC50", "ec50_nM")]
+                    if pd.notna(r[col])]
+        if not measured:
+            continue
+        label, value = measured[0]
+        q = f"For the ligand {r['LigNm']} bound in PDB entry {r['pdb_id']}, how does its crystallographic model quality compare to its measured binding potency?"
+        a = (
+            f"These are two independent measurements: the modelled pose has RSCC={rscc:.3f} against "
+            f"{r['pdb_id']}'s density ({fit}), while BindingDB separately reports {label}={value:g} nM "
+            f"measured potency for this ligand against its target. A ligand can have excellent density "
+            f"fit and weak measured potency (it was simply present at high soak concentration), or the "
+            f"reverse (a genuinely potent binder captured at partial occupancy or in a flexible pose) — "
+            f"pose quality tells you how confidently the coordinates are known, not how tightly the "
+            f"molecule binds."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_multihop_fold_function(cath_joined_df: pd.DataFrame, uniprot_df: pd.DataFrame,
+                                rng: random.Random, n: int) -> list[dict]:
+    """3-hop synthesis: PDB -> CATH fold classification joined with PDB -> SIFTS -> UniProt function,
+    combined into one answer connecting *shape* to *function* — related but not interchangeable, a
+    relationship the existing single-source generators (gen_cath_fold, gen_uniprot_function) never
+    state explicitly."""
+    m = cath_joined_df.merge(uniprot_df, left_on="SP_PRIMARY", right_on="accession", how="inner")
+    m = m[m["function"].notna() & (m["function"] != "")]
+    if m.empty:
+        return []
+    rows = m.sample(n=min(n, len(m)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"How does the CATH fold classification of PDB entry {r['PDB'].upper()} chain {r['CHAIN']} relate to what the protein actually does?"
+        func = str(r["function"])[:400]
+        a = (
+            f"Chain {r['CHAIN']} of {r['PDB'].upper()} is classified by CATH as "
+            f"{r['class_desc']} / {r['architecture_desc']} / {r['topology_desc']} / {r['homology_desc']} "
+            f"(domain {r['CATH_ID']}). Its UniProt entry ({r['SP_PRIMARY']}) describes the protein's "
+            f"function as: \"{func}\". Fold and function are correlated but not synonymous: proteins "
+            f"sharing a CATH homologous superfamily often share function (that's the classification's "
+            f"basis), but the same broad fold can also be reused for unrelated functions by evolution, "
+            f"and function ultimately depends on specific active-site/interface residues the fold alone "
+            f"doesn't specify — so treat the fold as context for the function, not proof of it."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+# --- Round 3: cross-database disagreement + missing-data honesty -----------
+
+def gen_cross_db_disagreement(entries_df: pd.DataFrame, sifts_uniprot_df: pd.DataFrame,
+                               uniprot_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Cross-database disagreement: RCSB's entry-level organism call and UniProt's own organism
+    field for the mapped accession don't always literally match in string form (strain-level detail,
+    synonyms, or genuinely different constructs on different chains). Teaches the model to report
+    both sources rather than silently pick one when they diverge, and to explain *why* a mismatch
+    can be legitimate rather than assuming one source is simply wrong."""
+    sifts = sifts_uniprot_df.copy()
+    sifts["pdb_id"] = sifts["PDB"].str.upper()
+    m = entries_df[["pdb_id", "organism"]].merge(
+        sifts[["pdb_id", "SP_PRIMARY"]].drop_duplicates("pdb_id"), on="pdb_id", how="inner")
+    m = m.merge(uniprot_df[["accession", "organism"]], left_on="SP_PRIMARY", right_on="accession",
+                how="inner", suffixes=("_rcsb", "_uniprot"))
+    m = m[m["organism_rcsb"].notna() & m["organism_uniprot"].notna() & (m["organism_rcsb"] != "") & (m["organism_uniprot"] != "")]
+    mismatched = m[m["organism_rcsb"].str.strip().str.lower() != m["organism_uniprot"].str.strip().str.lower()]
+    if mismatched.empty:
+        return []
+    rows = mismatched.sample(n=min(n, len(mismatched)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"What organism is the protein in PDB entry {r['pdb_id']} from? Check both RCSB's entry metadata and the mapped UniProt record."
+        a = (
+            f"These two sources don't literally agree: RCSB's entry-level source organism for "
+            f"{r['pdb_id']} is recorded as '{r['organism_rcsb']}', while UniProt {r['SP_PRIMARY']} "
+            f"(the accession this chain maps to via SIFTS) lists '{r['organism_uniprot']}'. This isn't "
+            f"necessarily an error in either source — common legitimate causes include: the RCSB field "
+            f"describing the specific expression construct or strain used, UniProt describing the "
+            f"canonical/reference organism for that gene family, a chimeric or engineered construct, "
+            f"or one source simply being more taxonomically specific than the other. Report both rather "
+            f"than picking one, and note the discrepancy explicitly rather than silently resolving it."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_missing_data_honesty(entries_df: pd.DataFrame, validation_df: pd.DataFrame,
+                              rng: random.Random, n: int) -> list[dict]:
+    """Missing-data honesty: sample entries where a commonly-expected field (R-free, or a wwPDB
+    validation metric) is genuinely absent, and generate the correct 'not available, here's why'
+    answer rather than letting the fine-tuned model fabricate a plausible-looking number. This is
+    the single most important refusal-adjacent behaviour for a database-grounded assistant — the
+    training data must contain real examples of admitting absence, not just presence."""
+    out = []
+    no_rfree = entries_df[(entries_df["method"] == "X-RAY DIFFRACTION") & entries_df["resolution_A"].notna() & entries_df["r_free"].isna()]
+    if not no_rfree.empty:
+        rows = no_rfree.sample(n=min(n // 2, len(no_rfree)), random_state=rng.randint(0, 1 << 30))
+        for _, r in rows.iterrows():
+            q = f"What is the R-free value for PDB entry {r['pdb_id']}?"
+            a = (
+                f"R-free isn't recorded in this entry's deposited metadata for {r['pdb_id']} — this "
+                f"happens for older depositions (R-free reporting wasn't universally required until "
+                f"the late 1990s) or entries refined with software that didn't compute/report it. I "
+                f"won't estimate a value: an absent R-free doesn't mean the structure is untrustworthy, "
+                f"just that this particular quality metric wasn't captured. Resolution "
+                f"({float(r['resolution_A']):.2f} Å) and the wwPDB validation report's geometry metrics "
+                f"are still available checks."
+            )
+            out.append(make_example(q, a, "database_cross_referencing"))
+    if not validation_df.empty:
+        has_entry = set(entries_df["pdb_id"])
+        validated_ids = set(validation_df["pdb_id"])
+        missing_ids = has_entry - validated_ids
+        if missing_ids:
+            sample_ids = rng.sample(sorted(missing_ids), k=min(max(0, n - len(out)), len(missing_ids)))
+            for pid in sample_ids:
+                q = f"What's the clashscore for PDB entry {pid}?"
+                a = (
+                    f"No wwPDB validation-report clashscore is available for {pid} in this corpus. "
+                    f"Rather than guess, the honest answer is: not available here — check the entry's "
+                    f"live validation report directly at RCSB/PDBe, since coverage of the automated "
+                    f"validation pipeline (or of this project's own pull of it) isn't complete for "
+                    f"every deposited entry."
+                )
+                out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+# --- Round 3: comparative examples ------------------------------------------
+
+def gen_compare_two_entries(entries_df: pd.DataFrame, sifts_uniprot_df: pd.DataFrame,
+                             rng: random.Random, n: int) -> list[dict]:
+    """Comparative: pick two different PDB entries mapped to the same UniProt accession and compare
+    them head-to-head (resolution, method, R-free) — the "which structure should I use" question
+    that single-entry generators can't answer, since it requires holding two rows in context at
+    once."""
+    sifts = sifts_uniprot_df.copy()
+    sifts["pdb_id"] = sifts["PDB"].str.upper()
+    m = entries_df[["pdb_id", "resolution_A", "r_free", "method"]].merge(
+        sifts[["pdb_id", "SP_PRIMARY"]].drop_duplicates(), on="pdb_id", how="inner")
+    m = m[m["resolution_A"].notna()].drop_duplicates("pdb_id")
+    counts = m.groupby("SP_PRIMARY")["pdb_id"].nunique()
+    multi = counts[counts >= 2]
+    if multi.empty:
+        return []
+    accs = rng.sample(list(multi.index), k=min(n, len(multi)))
+    out = []
+    for acc in accs:
+        g = m[m["SP_PRIMARY"] == acc]
+        pair = g.sample(n=2, random_state=rng.randint(0, 1 << 30))
+        a_row, b_row = pair.iloc[0], pair.iloc[1]
+        better, worse = (a_row, b_row) if float(a_row["resolution_A"]) < float(b_row["resolution_A"]) else (b_row, a_row)
+        q = f"UniProt {acc} has both PDB entries {a_row['pdb_id']} and {b_row['pdb_id']}. How do they compare, and which should I use?"
+        a = (
+            f"{a_row['pdb_id']}: {a_row['method']}, {float(a_row['resolution_A']):.2f} Å"
+            + (f", R-free {float(a_row['r_free']):.3f}" if pd.notna(a_row.get("r_free")) else "")
+            + f". {b_row['pdb_id']}: {b_row['method']}, {float(b_row['resolution_A']):.2f} Å"
+            + (f", R-free {float(b_row['r_free']):.3f}" if pd.notna(b_row.get("r_free")) else "")
+            + f". By resolution alone, {better['pdb_id']} is the sharper structure "
+              f"({_resolution_bucket(float(better['resolution_A']))}) vs {worse['pdb_id']} "
+              f"({_resolution_bucket(float(worse['resolution_A']))}). But 'better' depends on your "
+              f"question: prefer the higher-resolution entry for fine geometric detail, but check "
+              f"which entry actually contains the ligand, mutation, or conformational state you care "
+              f"about — a lower-resolution structure capturing the right biological state is often "
+              f"more useful than a sharper one that doesn't."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+# --- Round 3: RAG-shaped synthesis ------------------------------------------
+
+def gen_rag_synthesis(entries_df: pd.DataFrame, sifts_uniprot_df: pd.DataFrame,
+                       uniprot_df: pd.DataFrame, pharos_df: pd.DataFrame,
+                       validation_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """RAG-shaped synthesis: presents a prompt formatted the way real retrieved context looks
+    (numbered, source-tagged chunks) and requires a synthesized, source-citing answer — training the
+    model to work the way it will actually be used at inference time behind the RAG retriever, not
+    just to answer bare questions about pre-selected facts."""
+    sifts = sifts_uniprot_df.copy()
+    sifts["pdb_id"] = sifts["PDB"].str.upper()
+    m = entries_df[["pdb_id", "resolution_A", "r_free", "method"]].merge(
+        sifts[["pdb_id", "SP_PRIMARY", "CHAIN"]].drop_duplicates("pdb_id"), on="pdb_id", how="inner")
+    m = m.merge(uniprot_df[["accession", "protein_name", "function"]], left_on="SP_PRIMARY", right_on="accession", how="inner")
+    m = m[m["resolution_A"].notna() & m["function"].notna() & (m["function"] != "")]
+    if not pharos_df.empty:
+        m = m.merge(pharos_df[["uniprot", "tdl", "name"]], left_on="SP_PRIMARY", right_on="uniprot", how="left")
+    if not validation_df.empty:
+        m = m.merge(validation_df[["pdb_id", "clashscore"]], on="pdb_id", how="left")
+    if m.empty:
+        return []
+    rows = m.sample(n=min(n, len(m)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        chunks = [
+            f"[Source: rcsb/pdb_entries_enriched.csv, entry {r['pdb_id']}] method={r['method']}, "
+            f"resolution_A={float(r['resolution_A']):.2f}" + (f", r_free={float(r['r_free']):.3f}" if pd.notna(r.get("r_free")) else ""),
+            f"[Source: uniprot/uniprot_entries.csv, accession {r['SP_PRIMARY']}] protein_name={r['protein_name']}; "
+            f"function={str(r['function'])[:300]}",
+        ]
+        if pd.notna(r.get("tdl")):
+            chunks.append(f"[Source: pharos/pharos_targets.csv, uniprot {r['SP_PRIMARY']}] target_development_level={r['tdl']}, name={r['name']}")
+        if pd.notna(r.get("clashscore")):
+            chunks.append(f"[Source: validation/wwpdb_validation.csv, entry {r['pdb_id']}] clashscore={float(r['clashscore']):.2f}")
+        rng.shuffle(chunks)
+        context = "\n".join(chunks)
+        q = (
+            f"Using only the retrieved context below, give a complete answer about PDB entry {r['pdb_id']} "
+            f"— what it is, what it does, and its quality — and cite which source each fact came from.\n\n"
+            f"Retrieved context:\n{context}"
+        )
+        a_parts = [
+            f"{r['pdb_id']} is a {r['method']} structure at {float(r['resolution_A']):.2f} Å"
+            + (f" (R-free {float(r['r_free']):.3f})" if pd.notna(r.get("r_free")) else "")
+            + f" [rcsb/pdb_entries_enriched.csv].",
+            f"It's {r['protein_name']} (UniProt {r['SP_PRIMARY']}): {str(r['function'])[:300]} [uniprot/uniprot_entries.csv].",
+        ]
+        if pd.notna(r.get("tdl")):
+            a_parts.append(f"Pharos classifies this target at development level {r['tdl']} [pharos/pharos_targets.csv].")
+        if pd.notna(r.get("clashscore")):
+            a_parts.append(f"Model geometry: clashscore {float(r['clashscore']):.2f} [validation/wwpdb_validation.csv].")
+        a_parts.append(
+            "Synthesizing across sources: structural quality (resolution/R-free/clashscore) and "
+            "biological/pharmacological context (function, target development level) come from "
+            "independent databases and should each be cited to its own source rather than blended "
+            "into one unattributed claim."
+        )
+        a = " ".join(a_parts)
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Refusal boundary (supplementary, small)
 # ---------------------------------------------------------------------------
@@ -823,9 +1518,10 @@ def main() -> None:
     all_examples += gen_format_pdb_vs_mmcif(c["entries"][c["entries"]["atom_count"] > 20000], rng, k)
     all_examples += gen_biological_assembly_asu(c["entries"], rng, k)
 
-    # experimental_method — split across 7 generators (added unit_cell/space_group and
-    # crystallization_conditions once the expanded RCSB metadata pull made them possible)
-    k = per_class // 7
+    # experimental_method — split across 10 generators. Round 3 added validation_geometry,
+    # alphafold_vs_experimental, and multihop_structure_quality_full once wwPDB validation and
+    # AlphaFold DB were pulled in.
+    k = per_class // 10
     print("Generating experimental_method ...")
     all_examples += gen_xray_resolution_quality(c["entries"], rng, k)
     all_examples += gen_rfree_quality(c["entries"], rng, k)
@@ -834,11 +1530,14 @@ def main() -> None:
     all_examples += gen_twilight_ligand_fit(c["twilight"], rng, k)
     all_examples += gen_unit_cell_space_group(c["entries"], rng, k)
     all_examples += gen_crystallization_conditions(c["entries"], rng, k)
+    all_examples += gen_validation_geometry(c["validation"], c["entries"], rng, k)
+    all_examples += gen_alphafold_vs_experimental(c["alphafold"], c["entries"], c["sifts_uniprot"], rng, k)
+    all_examples += gen_multihop_structure_quality_full(c["entries"], c["validation"], rng, k)
 
-    # tool_calling — split across 5 generators. DSSP and NMR-model-count are execution-verified
-    # against the full 256,444-file mmCIF pool (data/structures_all/, corpus expansion round 2)
-    # now, not the original 820-file sample — no longer the bottleneck it was in round 1.
-    k = per_class // 5
+    # tool_calling — split across 7 generators. DSSP and NMR-model-count are execution-verified
+    # against the full 256,444-file mmCIF pool (data/structures_all/, corpus expansion round 2).
+    # Round 3 added the two tool-chaining generators (multi-step scripts, not one-call-per-example).
+    k = per_class // 7
     print("Generating tool_calling ...")
     all_examples += gen_biopython_count(c["entries"], rng, k)
     all_examples += gen_gemmi_metadata(c["entries"], rng, k)
@@ -846,10 +1545,16 @@ def main() -> None:
     print("  running DSSP on real structure files (execution-verified) ...")
     all_examples += gen_dssp_secondary_structure(c["structure_files"], rng, k)
     all_examples += gen_nmr_model_count(c["structure_files"], c["entries"], rng, k)
+    print("  running tool-chain (parse+DSSP) analysis scripts (execution-verified) ...")
+    all_examples += gen_tool_chain_structure_analysis(c["structure_files"], rng, k)
+    all_examples += gen_tool_chain_lookup(c["sifts_uniprot"], c["pharos"], rng, k)
 
-    # database_cross_referencing — split across 9 generators (added citation and
-    # organism/taxonomy once the expanded RCSB metadata pull made them possible)
-    k = per_class // 9
+    # database_cross_referencing — split across 21 generators. Round 3 added: single-source
+    # generators for BindingDB/STRING/AlphaFold; bidirectional traversal (UniProt->PDB,
+    # ligand->PDB); deeper multi-hop chains (target context, ligand quality, fold->function);
+    # cross-database disagreement + missing-data honesty; comparative (two entries); and a
+    # RAG-shaped multi-source synthesis generator.
+    k = per_class // 21
     print("Generating database_cross_referencing ...")
     all_examples += gen_uniprot_chain_mapping(c["sifts_uniprot"], rng, k)
     all_examples += gen_pfam_domain(c["sifts_pfam"], rng, k)
@@ -860,6 +1565,18 @@ def main() -> None:
     all_examples += gen_ccd_identity(c["ccd"], rng, k)
     all_examples += gen_citation(c["entries"], rng, k)
     all_examples += gen_organism_taxonomy(c["entries"], rng, k)
+    all_examples += gen_binding_affinity(c["bindingdb"], rng, k)
+    all_examples += gen_string_interactors(c["string"], rng, k)
+    all_examples += gen_alphafold_confidence(c["alphafold"], rng, k)
+    all_examples += gen_uniprot_to_pdb_aggregate(c["sifts_uniprot"], rng, k)
+    all_examples += gen_ligand_to_pdb_aggregate(c["twilight"], rng, k)
+    all_examples += gen_multihop_target_context(c["entries"], c["sifts_uniprot"], c["pharos"], c["bindingdb"], rng, k)
+    all_examples += gen_multihop_ligand_quality_chain(c["twilight"], c["bindingdb"], rng, k)
+    all_examples += gen_multihop_fold_function(c["cath_joined"], c["uniprot"], rng, k)
+    all_examples += gen_cross_db_disagreement(c["entries"], c["sifts_uniprot"], c["uniprot"], rng, k)
+    all_examples += gen_missing_data_honesty(c["entries"], c["validation"], rng, k)
+    all_examples += gen_compare_two_entries(c["entries"], c["sifts_uniprot"], rng, k)
+    all_examples += gen_rag_synthesis(c["entries"], c["sifts_uniprot"], c["uniprot"], c["pharos"], c["validation"], rng, k)
 
     # supplementary refusal boundary
     print("Generating refusal_boundary ...")
