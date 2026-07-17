@@ -6,16 +6,17 @@ MLX-LM expects a data directory containing `train.jsonl` and `valid.jsonl` (note
 ```
 data/
 ├── corpus/            # RAG sources: RCSB/SIFTS/CATH/InterPro/Pharos/TWILIGHT/UniProt/AlphaFold/
-│                        # BindingDB/wwPDB-validation/STRING (gitignored, Phase 2 + corpus expansion
-│                        # + round 3 sources, 2026-07-16)
+│                        # BindingDB/wwPDB-validation/STRING/PDB-REDO/EMDB/SCOP2/MobiDB/OPM/
+│                        # clusters/obsolete/AlphaFraud/citations/disease_context (gitignored,
+│                        # Phase 2 + corpus expansion + round 3 + round 4 sources, 2026-07-17)
 ├── structures/         # 820-file PDB-format sample, superseded by structures_all/ below but kept
 │                        # (small, fast for smoke-testing) — gitignored, scripts/download_structure_pool.py
 ├── structures_all/      # ALL 256,444 entries as native mmCIF, 353 GB (gitignored, "let's add ALL PDB
 │                         # files" round, 2026-07-16) — scripts/download_all_structures.py
-└── sft/               # SFT data (MLX --data directory), v3 populated 2026-07-16
-    ├── train.jsonl     # 77,793 examples
-    ├── valid.jsonl     # 9,724 examples
-    └── test.jsonl      # 9,724 examples, frozen, eval only
+└── sft/               # SFT data (MLX --data directory), v4 populated 2026-07-17
+    ├── train.jsonl     # 74,981 examples
+    ├── valid.jsonl     # 9,372 examples
+    └── test.jsonl      # 9,372 examples, frozen, eval only
 ```
 
 ## SFT format
@@ -74,11 +75,17 @@ prompt shortened here for readability, full text is in `config/system_prompt.txt
 |---|---|---|---|---|---|
 | v1 | R1 | 45,502 (36,402 train) | 2.2% | `build_dataset.py --n 50000 --seed 51` | Target was 50,000; `tool_calling`'s two execution-verified generators (DSSP, NMR model count) were hard-capped by an 820-file structure pool, not padded. Superseded by v2. |
 | v2 | R2 | 50,233 (40,187 train) | 1.5% | `build_dataset.py --n 50000 --seed 51` (after "let's add ALL PDB files and ALL fields" — full mmCIF pool + expanded RCSB metadata) | Full 50,000 target hit; `tool_calling` reaches its complete 12,500 target for the first time (previously capped at 8,010) now that the structure pool is 256,444 files instead of 820. Added 4 new generators (citation, unit cell/space group, crystallization conditions, organism/taxonomy) from the expanded metadata pull. Superseded by v3. |
-| v3 | R3 | 97,241 (77,793 train) | 1.2% | `build_dataset.py --n 100000 --seed 51` (after "get AlphaFolddb, PDBbind/BindingDB, wwPDB validation reports, and STRING... make it all thorough") | 4 new corpus sources + ~19 new generators across multi-hop chains, bidirectional traversal, cross-database disagreement, missing-data honesty, comparative examples, tool-chaining, and RAG-shaped synthesis. Target doubled to 100,000 to match the larger generator roster; landed at 97,241 (97% of target) with the lowest rejection rate yet. |
+| v3 | R3 | 97,241 (77,793 train) | 1.2% | `build_dataset.py --n 100000 --seed 51` (after "get AlphaFolddb, PDBbind/BindingDB, wwPDB validation reports, and STRING... make it all thorough") | 4 new corpus sources + ~19 new generators across multi-hop chains, bidirectional traversal, cross-database disagreement, missing-data honesty, comparative examples, tool-chaining, and RAG-shaped synthesis. Target doubled to 100,000 to match the larger generator roster; landed at 97,241 (97% of target) with the lowest rejection rate yet. Superseded by v4. |
+| v4 | R4 | 93,725 (74,981 train) | 2.7% | `build_dataset.py --n 100000 --seed 51` (after a Fable 5 brainstorm on remaining expert-depth gaps, implemented in full) | 7 new corpus sources + AlphaFraud (staged) + independent CrossRef/PubMed citation verification + 5 new local tool-exec integrations (FreeSASA/fpocket/Foldseek/US-align/PLIP) + ~34 new generators. Landed at 93,725 (94% of target); rejection rate ticked up from v3's 1.2% since several round-4 generators haven't had multiple tuning passes yet. Full run took ~8.5h, dominated by the new execution-verified tool-calling generators' long subprocess tail (fpocket especially). |
 
-v3 class balance: `file_format_literacy` 25,000, `tool_calling` 24,993, `database_cross_referencing`
-23,769, `experimental_method` 22,500, `refusal_boundary` 1,000 (supplementary, not counted toward
-the four-class equal split).
+v4 class balance: `file_format_literacy` 25,000, `database_cross_referencing` 23,201,
+`experimental_method` 21,875, `tool_calling` 21,653, `refusal_boundary` 2,000 (supplementary, not
+counted toward the four-class equal split — includes the new mutation/variant-effect refusal
+variant alongside the original bare-structure-prediction one).
+
+v4 token length (Qwen3-32B-4bit tokenizer, full chat-template-rendered example, n=2,000 sample):
+p50=582, p90=683, p95=729, p99=891, max=1,431 — comfortable margin under any `max_seq_length`
+chem_sage used (2048–3072); no examples needed truncation.
 
 v3 token length (Qwen3-32B-4bit tokenizer, full chat-template-rendered example, n=2,000 sample):
 p50=578, p90=704, p95=734, p99=940, max=1,969 — comfortable margin under any `max_seq_length`
@@ -206,5 +213,63 @@ regex (`\bnan\b`/`\bnone\b`) so "nanomolar" and similar real words don't false-p
 **Result: 97,241 examples** (77,793 train / 9,724 valid / 9,724 test) — up from v2's 50,233, on a
 target doubled to 100,000 to match the larger generator roster, landing at 97% of target with the
 lowest rejection rate of any round (1.2%, down from v2's 1.5%). `corpus_lookup.py`'s registry and the
-RAG corpus (now 22 files / 79,235 chunks, up from 18 / 65,811) were updated with all four new source
-files.
+RAG corpus (round 3: 22 files / 79,235 chunks, up from 18 / 65,811) were updated with all four new
+source files.
+
+**Round 4 (2026-07-17): Fable 5 expert-depth brainstorm, implemented in full.** Marc asked Fable 5
+what's still missing to make chatPDB a genuine protein-structure expert, then asked for all of it:
+seven new corpus sources (PDB-REDO, EMDB, SCOP2, MobiDB, OPM, sequence-redundancy clusters,
+obsolete-entry mapping), a staged AlphaFraud integration, independent CrossRef/PubMed citation
+verification, five new local tool-exec integrations (FreeSASA, fpocket, Foldseek, US-align, PLIP),
+and ~34 new generators. Full source-by-source detail is in `PROJECT_PLAN.md`'s round 4 section;
+this entry focuses on the dataset-generation outcome.
+
+**Construction rule additions this round:**
+- **House "structure report card" format** (`_structure_report_card()`): a consistent,
+  scannable template (resolution + bucket, R-free + gap, clashscore + percentile, Rama/rotamer
+  outliers, one-line verdict) reused across new `experimental_method` generators — the single
+  cheapest, highest perceived-expertise change of the round.
+- **Calibrated citation trust, not blind trust.** Every citation-bearing example now routes through
+  `scripts/verify_citations.py`'s independently-verified bucket (verified / mismatched /
+  unresolvable) rather than repeating the deposited DOI/title string as fact.
+- **Bidirectional and multi-hop patterns extended further**: family/homolog-level reasoning (CATH
+  superfamily → member set, not just single-entry facts), structural biography (a UniProt's full
+  PDB timeline), and assembly biography (real FreeSASA-backed interface area, not just the
+  `assembly_count` metadata field).
+
+**Six real bugs found and fixed** (three of them serious enough to have corrupted data if shipped
+unfixed) — full detail in `PROJECT_PLAN.md`'s round 4 section, summarized here:
+1. PDB-REDO's rsync pull silently stalled (ESTABLISHED connection, ~0 CPU, zero progress) — switched
+   to HTTP per-entry fetches.
+2. AlphaFraud's first "timeout" fix didn't free the stuck worker thread, so it wasn't actually a
+   fix — every subsequent request queued behind the stuck one forever. Real fix: a throwaway
+   executor per request, abandoned (not joined) on timeout.
+3. EMDB's search-based pull had no real termination condition (returned far more documents than the
+   real 59,608-entry total, unbounded duplicates) — switched to the bulk holdings index + per-entry
+   REST calls.
+4. `verify_citations.py` crashed on a NaN `citation_year` — the same "pandas NaN is not `None`" bug
+   class this project has hit before, in a file that hadn't yet absorbed the lesson. This was also
+   the real explanation for a run that looked "stuck" at one checkpoint for over an hour: it had
+   silently crashed early, and monitoring kept re-reading a stale log.
+5. **CrossRef rate-limiting (HTTP 429) was silently misclassified as "this DOI doesn't exist"** —
+   caught only by noticing an implausible ~44% unresolvable rate mid-run. Would have taught the
+   model that huge fractions of real PDB citations are fake had it shipped. Fixed with real
+   retry-with-backoff, a separate `rate_limited` bucket, and empirically-tuned concurrency (true
+   post-fix unresolvable rate: 0.1%).
+6. OPM's original sequential puller would have taken ~8 hours for 15,014 entries — switched to
+   concurrent fetching, finished in 24 minutes.
+
+**Timeline:** the full generation run took **~8.5 hours**, confirmed genuine (not a hang) via
+repeated `sample`-based process profiling and direct child-process inspection catching real
+`fpocket`/`mkdssp`/`foldseek`/`USalign` subprocesses actively executing. The new execution-verified
+tool-calling generators — especially fpocket, whose exhaustive Voronoi-based pocket search has a
+real long tail on larger structures — dominate this round's runtime far more than round 3's
+DSSP-only `tool_calling` class did. Flagged the realistic timeline mid-run and confirmed with Marc
+to let it run to completion rather than truncate or reduce scope.
+
+**Result: 93,725 examples** (74,981 train / 9,372 valid / 9,372 test) — landed at 94% of the
+100,000 target, reported honestly rather than padded, same discipline as every round. Rejection
+rate (2.7%) is higher than v3's 1.2%, expected for a round this size on its first full-scale pass —
+several new generators haven't yet had the multiple smoke-test tuning passes the round-3 generators
+accumulated over their lifetime. `corpus_lookup.py`'s registry and the RAG corpus (now 37 files /
+102,163 chunks, up from 22 / 79,235) were updated with all round-4 source files.

@@ -65,6 +65,29 @@ MAX_CHUNKS_PER_CSV = {
     "string_interactions": 2_000,
     # top-15,000-accession predictions, moderate per-row (gene, organism, confidence breakdown)
     "alphafold_predictions": 5_000,
+    # Round 4 sources
+    # ~256k-entry re-refinement metadata, short per-row numeric fields — same shape as validation
+    "pdbredo_metadata": 3_000,
+    # ~68k EM entries matched to this corpus, moderate per-row (resolution, contour, pixel spacing)
+    "emdb_map_metadata": 3_000,
+    # SCOP2 fold/superfamily names per PDB chain, short per-row — similar to CATH classification
+    "scop2_domain_names": 3_000,
+    # disorder regions for ~29k accessions with real MobiDB data, short per-row
+    "mobidb_disorder": 2_000,
+    # curated set, small (~15k entries), low cap not needed
+    "opm_membrane_placement": 2_000,
+    # 1.6M entity-cluster rows at 30% identity alone — low semantic diversity per row, group heavily
+    "clusters_30pct": 2_000,
+    "clusters_40pct": 1_000, "clusters_50pct": 1_000, "clusters_70pct": 1_000,
+    "clusters_90pct": 1_000, "clusters_95pct": 1_000, "clusters_100pct": 1_000,
+    # ~6k obsolete entries, small
+    "obsolete_entries": 1_000,
+    # staged/partial (AlphaFraud backfill still running) -- whatever's there, moderate cap
+    "alphafraud_comparisons": 3_000,
+    # ~102k distinct DOIs verified, short per-row (bucket, similarity score)
+    "citation_verification": 3_000,
+    # hand-built cache, tiny (11 rows) -- no cap needed, included for completeness
+    "disease_target_context": 100,
     # default cap for any CSV not listed above
     "__default__": 5_000,
 }

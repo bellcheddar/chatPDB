@@ -20,6 +20,15 @@ biopandas                   # tabular PDB/mmCIF wrangling
 MDAnalysis                  # ensembles / NMR models
 prody                       # complementary structural analysis
 # PyMOL: install separately (conda-forge pymol-open-source, or licensed PyMOL) — not pip-installable cleanly
+freesasa                    # real SASA/buried-interface-area computation (round 4)
+openbabel==3.2.1             # pinned: pip's default resolution picked 3.1.1, which fails to import
+                              # against the brew-installed native lib on this machine (AttributeError
+                              # on _openbabel.OBKekulize) -- 3.2.1 matches and works. Needs `swig`
+                              # (brew) as a build-time dependency, undocumented by plip itself.
+plip                         # real protein-ligand interaction fingerprints (round 4)
+# Foldseek / US-align / fpocket / cctbx: not pip packages -- see PROJECT_PLAN.md round 4 section
+# for install method (Foldseek: GitHub release binary; US-align/fpocket: brew tap brewsci/bio;
+# cctbx: attempted, abandoned after repeated network failures, optional).
 
 # --- Chat CLI ---
 rich                        # console rendering (Markdown, panels, progress, themes)

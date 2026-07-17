@@ -1,3 +1,7 @@
+# Third-party tool binaries/builds (Foldseek DB, cctbx bootstrap, etc. -- large, machine-specific,
+# re-buildable from scripts/build_foldseek_db.py / tools/cctbx/bootstrap.py, never commit)
+tools/
+
 # Data and models (never commit corpora, weights, or adapters)
 data/corpus/
 data/sft/*.jsonl

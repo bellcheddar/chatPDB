@@ -9,13 +9,16 @@ reasons about structures that already exist, their provenance, and how to query 
 with real tools.
 
 **Author:** Marc C. Deller, D.Phil. ([marcdeller.com](https://marcdeller.com))
-**Status:** Phase 3 (SFT dataset) complete, round 3 (2026-07-16): four new corpus sources (AlphaFold
-DB, BindingDB, wwPDB validation reports, STRING) and ~19 new generators implementing deeper
-multi-hop chains, bidirectional traversal, cross-database disagreement, comparative examples,
-tool-chaining skills, and RAG-shaped synthesis examples. Base model: `mlx-community/Qwen3-32B-4bit`.
-RAG corpus: 22 files / 79,235 chunks. SFT dataset v3: 97,241 examples (77,793 train / 9,724 valid /
-9,724 test), target doubled to 100,000 to match the larger generator roster, landed at 97% with the
-lowest rejection rate yet (1.2%). Nearly 5x chem_sage's largest round (20,000, R5).
+**Status:** Phase 3 (SFT dataset) complete, round 4 (2026-07-17): seven new corpus sources
+(PDB-REDO, EMDB, SCOP2, MobiDB, OPM, sequence-redundancy clusters, obsolete-entry mapping), a
+staged AlphaFraud integration, an independent CrossRef/PubMed citation-verification pipeline, five
+new local tool-exec integrations (FreeSASA, fpocket, Foldseek, US-align, PLIP), and ~34 new
+generators covering house report-card formatting, family/homolog reasoning, structural/assembly
+biography, self-consistency checks, mutation-refusal, and a small disease-target-context chain.
+Base model: `mlx-community/Qwen3-32B-4bit`. RAG corpus: 37 files / 102,163 chunks (up from
+22 / 79,235). SFT dataset v4: 93,725 examples (74,981 train / 9,372 valid / 9,372 test),
+2.7% rejection rate, full regeneration ran ~8.5h (dominated by the new execution-verified
+tool-calling generators' long subprocess tail — see `data/README.md`'s v4 entry).
 Phase 4 (QLoRA fine-tune) not yet started.
 **Fine-tune stack:** MLX-LM on Apple Silicon (committed — same choice chem_sage validated over five
 rounds; see section 3).
@@ -119,7 +122,16 @@ Not a complete list — a starting map, organized by category, with the access m
 - **PDBe** (EMBL-EBI) — `www.ebi.ac.uk/pdbe/api`, separate modules for PDB/EMDB/SIFTS/PISA/validation.
 - **PDBj** (Japan) — the third wwPDB partner; include for completeness and cross-checking.
 - **BMRB** — Biological Magnetic Resonance Data Bank (wwPDB member): NMR restraints/chemical shifts.
-- **EMDB** — cryo-EM map metadata, resolution, FSC curves.
+- **EMDB** ✅ **implemented** (`scripts/download_emdb.py`, round 4) — cryo-EM map metadata
+  (resolution + determination method, contour level, pixel spacing, symmetry). Initially attempted
+  via `api/search/*` pagination assuming one document per entry; wrong — the search index returns
+  far more documents than the real 59,608-entry total (confirmed live: still-valid, non-duplicate
+  EMDB IDs kept appearing past a 350,000 offset), producing unbounded duplicate matches. Fixed by
+  switching to the bulk holdings index
+  (`ftp.ebi.ac.uk/pub/databases/emdb/status/latest/emdb_released_holdings.json`, confirmed exactly
+  59,608 entries) for the definitive ID list, then per-entry REST calls
+  (`www.ebi.ac.uk/emdb/api/entry/{id}`), concurrent. Result: 34,856 entries matched to a PDB entry
+  already in this corpus.
 - **wwPDB Chemical Component Dictionary (CCD) / BIRD** ✅ **implemented** — full 53,417-entry
   dictionary parsed from the bulk `components.cif.gz` with gemmi (Phase 2), not the drug-like subset.
 - **wwPDB validation reports** ✅ **implemented** (`scripts/download_wwpdb_validation.py`, round 3) —
@@ -131,7 +143,15 @@ Not a complete list — a starting map, organized by category, with the access m
   of structure QC — per-ligand-instance RSCC/OWAB density-quality scores, 870k rows. Together these
   cover both halves of "is this a good structure": data-fit (resolution/R-free) and model-geometry
   (Ramachandran/rotamer/clashscore) and ligand-pose-fit (RSCC).
-- **PDB-REDO** — re-refined/re-built X-ray structures; a good source of "what changed and why" pairs.
+- **PDB-REDO** ✅ **implemented** (`scripts/download_pdbredo.py`, round 4) — re-refined/re-built
+  X-ray structures, real R-free before/after deltas ("deposited != optimal" as a trained judgment,
+  not just a metadata field). Initially attempted via `rsync://rsync.pdb-redo.eu/pdb-redo/`
+  (metadata-only filter dry-run tested and confirmed correct), but the real full-tree pull stalled
+  silently — an ESTABLISHED TCP connection with zero files written after 25+ minutes, the same
+  silent-hang shape this project has repeatedly hit with long-lived connections. Switched to HTTP
+  per-entry fetches (`pdb-redo.eu/db/{pdbid}/data.json`, confirmed live) against this corpus's own
+  known 256,448 PDB IDs instead of having rsync enumerate PDB-REDO's tree. Result: 195,194 entries
+  with PDB-REDO data (median R-free delta +0.01, 95,847 entries improved by >0.01 on re-refinement).
 
 ### Predicted / computational structures
 - **AlphaFold DB** ✅ **implemented** (`scripts/download_alphafold.py`, round 3) —
@@ -159,9 +179,14 @@ Not a complete list — a starting map, organized by category, with the access m
   PDB-referenced subset.
 - **CATH** ✅ **implemented** (`scripts/download_cath.py`) — full classification hierarchy
   (601,328 domains, 8,151 named codes), joined to the SIFTS PDB→CATH-domain-ID mapping.
-  **SCOP2** — deferred: SCOP has migrated fully under PDBe as a JS SPA with no discoverable public
-  API (multiple candidate hosts tried and failed, 2026-07-16); only the SIFTS domain-ID mapping
-  (no fold descriptions) is available for now.
+  **SCOP2** ✅ **implemented** (`scripts/download_scop2.py`, round 4) — fold/superfamily/family
+  descriptions. SCOP2's own domain (scop.mrc-lmb.cam.ac.uk) genuinely still has no working scripted
+  API (its documented REST API 404s live, confirmed again this round — the earlier "deferred" call
+  was correct, not stale). The real working path turned out to be EBI's own PDBe mappings API
+  (`ebi.ac.uk/pdbe/api/mappings/scop2/{pdb_id}`, confirmed live), queried per PDB ID (SIFTS'
+  SF_DOMID/FA_DOMID turned out to be near-unique per-chain domain *instance* IDs, not reusable
+  classification node IDs as first assumed — 36,898 distinct out of 36,915 rows). Scoped to the
+  27,530 distinct PDB IDs already in `sifts_pdb_scop2.csv`. Result: 67,083 domain-level rows.
 - **Gene3D** — not yet pursued.
 
 ### Cross-reference & interaction annotation
@@ -176,9 +201,12 @@ Not a complete list — a starting map, organized by category, with the access m
   github.com/RomanLas/PDBsum1) is a local install-and-run generator with no bulk data or API: it
   processes a user-supplied PDB file into interaction diagrams. Better fit as a Phase 6 tool-calling
   candidate alongside PyMOL, not a Phase 2 download target.
-- **PISA** (EBI) — deferred: real, working per-assembly REST API
+- **PISA** (EBI) — still deferred as a bulk *download*: real, working per-assembly REST API
   (`ebi.ac.uk/pdbe/api/pisa/assembly/:pdbid/:assemblyid`), no bulk endpoint, same 256k-request
-  problem as PDBe-KB.
+  problem as PDBe-KB. **Practical substitute implemented instead (round 4):** FreeSASA
+  (`gen_freesasa_interface`/`gen_assembly_biography` in `build_dataset.py`) computes real buried
+  interface area locally (complex SASA vs. sum of isolated-chain SASA) on demand against the
+  downloaded mmCIF pool — sidesteps the 256k-request wall entirely rather than working around it.
 - **ProtCID** — not yet pursued.
 - **Pharos** (pharos.nih.gov, not in the original brainstorm — added on request) ✅ **implemented**
   (`scripts/download_pharos.py`) — target druggability/development level (TDL), joined via UniProt
@@ -196,14 +224,47 @@ Not a complete list — a starting map, organized by category, with the access m
   into memory) and filtered to the 113,366 rows whose PDB cross-reference field matches this
   corpus. Real measured Ki/IC50/Kd/EC50 potency data — the piece TWILIGHT's pose-fit RSCC doesn't
   cover (a ligand can be perfectly modelled and still bind weakly, or vice versa).
-- **PLIP** — protein-ligand interaction fingerprints. This is a **tool**, not a corpus source: run at
-  Phase 3 dataset-generation time, not downloaded in bulk.
+- **PLIP** ✅ **implemented as a tool** (round 4, `pip install plip`, `gen_plip_interactions`) —
+  real protein-ligand interaction fingerprints (H-bonds, hydrophobic contacts, π-stacking), run at
+  dataset-generation time against real bound ligands, not downloaded in bulk. Needed `swig` (via
+  brew) as an undocumented build dependency for its openbabel Python bindings, and only the openbabel
+  wheel pinned to the exact version matching the brew-installed native library (3.2.1, not the
+  default-resolved 3.1.1) actually imports without an `AttributeError` on this machine — confirmed
+  the hard way. PLIP only accepts legacy PDB format, converted via gemmi first (same pattern DSSP
+  already used).
 
 ### Membrane, disorder, nucleic acid, scattering
-- **OPM** (Orientations of Proteins in Membranes) and **PDBTM** — membrane protein topology annotation.
-- **DisProt** and **MobiDB** — intrinsic disorder annotation.
+- **OPM** ✅ **implemented** (`scripts/download_opm.py`, round 4) — membrane protein orientation/
+  bilayer placement. No formal scripted API (JS SPA), but its backing storage is a publicly
+  listable Google Cloud Storage bucket (`storage.googleapis.com/opm-assets`, confirmed live,
+  S3-style XML listing) — enumerable without a documented API. Each entry's `.pdb` file carries the
+  membrane placement as a REMARK line ("1/2 of bilayer thickness"). Originally pulled sequentially
+  with a per-file delay (~1.8s/request against this GCS-backed host, would have taken ~8h for the
+  full 15k-entry set); switched to concurrent fetching, same pattern as every other multi-request
+  downloader this round. Result: 15,013 entries. **PDBTM** — not pursued.
+- **MobiDB** ✅ **implemented** (`scripts/download_mobidb.py`, round 4) — intrinsic disorder
+  regions (curated where available, else a consensus prediction), a real biological reason a region
+  can be missing from a crystal structure. Confirmed live per-accession API works
+  (`mobidb.org/api/download?acc={acc}&format=json`); confirmed comma-separated batch queries
+  silently return only the first accession (no error) — genuinely one request per accession, no
+  working bulk/batch path found. Real coverage is partial (~40% of queried accessions have any
+  disorder data — most TrEMBL-tier accessions simply aren't computed), reported honestly rather
+  than padded. Result: 29,190 accessions with data out of 73,910 queried. **DisProt** — not
+  separately pursued (MobiDB already aggregates DisProt-curated data where it exists).
 - **NDB** (Nucleic Acid Database) — DNA/RNA and protein-nucleic-acid complex structures within the PDB.
 - **SASBDB** — small-angle scattering data, the solution-state complement to crystal structures.
+- **RCSB sequence-identity clusters** ✅ **implemented** (`scripts/download_rcsb_clusters.py`,
+  round 4, not in the original brainstorm) — precomputed clustering at 30/40/50/70/90/95/100%
+  identity thresholds (`cdn.rcsb.org/resources/sequence/clusters/clusters-by-entity-{N}.txt`,
+  confirmed live, not documented on RCSB's own clustering docs page — found only by direct fetch).
+  Answers "how many genuinely distinct structures of this protein exist," a question no single-entry
+  metadata field can answer.
+- **Obsolete/superseded PDB entries** ✅ **implemented** (`scripts/download_rcsb_obsolete.py`,
+  round 4, not in the original brainstorm) — confirmed live that this corpus's `status_code` field
+  is uniformly `REL`; obsolete entries were never pulled at all (RCSB's search API returns only
+  released entries by default). `data.rcsb.org/rest/v1/holdings/removed/entry_ids` (bulk list,
+  confirmed live) + per-entry `.../removed/{id}` for the replacement ID. Result: 6,103 obsolete
+  entries, most with a documented successor.
 
 ### Benchmarks, provenance, networks
 - **CASP** targets/results — structure-prediction benchmark history. Used as context/QA material
@@ -221,9 +282,70 @@ Not a complete list — a starting map, organized by category, with the access m
   that actually touch it.
 - **RCSB PDB-101 / Proteopedia** — plain-language educational explainers; a good source of
   well-written prose for the "explain this concept" behaviour class.
+- **AlphaFraud** ✅ **implemented, staged** (`scripts/download_alphafraud.py`, round 4, Marc's own
+  sibling project at alphafraud.mdeller.com, not in the original brainstorm) — real computed
+  TM-score/GDT-TS/lDDT/CA-RMSD and a FRAUD score / "confidently wrong" flag comparing AlphaFold
+  predictions against real post-training-cutoff experimental structures, replacing the round-3
+  `gen_alphafold_vs_experimental`'s thin pLDDT-only comparison. **Staged, not blocking:**
+  AlphaFraud's own historical backfill is still running server-side (confirmed live: its `/archive`
+  only has run labels through late 2022 plus a handful of 2026 weekly ones — 2023-2025 not yet
+  backfilled), so this round's pull only captured 8 real comparison rows. Pulls via the public
+  `/api/week/{label}` API (not a DB/SSH pull), tagged `pulled_at`; re-run with default args (no
+  `--limit-weeks`) once AlphaFraud's backfill completes for full coverage. Found and fixed a real
+  bug along the way: an initial "timeout" fix reused one `ThreadPoolExecutor(max_workers=1)` across
+  the whole loop, so `future.result(timeout=...)` stopped *waiting* on a stuck request but never
+  freed the pool's only worker thread — every subsequent week silently queued behind it forever
+  (looked identical to a hang: ESTABLISHED socket, ~0 CPU, no progress for over an hour). Real fix:
+  spin up a throwaway single-worker executor per request and abandon (never join) it on timeout.
+- **DOI/citation verification** ✅ **implemented** (`scripts/verify_citations.py`, round 4, not in
+  the original brainstorm — this is the mechanism behind Marc's "supported by real DOI checked
+  references" ask). Every citation-bearing entry's deposited DOI is independently checked against
+  CrossRef (exact-DOI lookup + title/year confirmation, not fuzzy discovery — much higher precision)
+  and cross-checked against the deposited PubMed ID via NCBI eutils' `esummary` (not `esearch`,
+  which had a real backend outage mid-development this round, independent of this script).
+  Deduplicated to the 102,285 distinct DOIs across `pdb_entries_enriched.csv` + BindingDB's
+  `article_doi`. Result: 97,283 verified / 4,893 mismatched / 108 unresolvable / 1 rate-limited out
+  of 109,542. **Two real bugs found and fixed:** (1) `year is None`/`if title` checks against
+  pandas-sourced values — pandas represents a missing numeric/string field as float `NaN`, not
+  `None`, and `NaN` is truthy in Python, so both checks silently missed the NaN case and crashed
+  the run partway through (70 real entries have a DOI but no citation_year) — fixed with
+  `pd.isna()`/`pd.notna()`, the same discipline `build_dataset.py` already uses everywhere. (2) A
+  much more consequential bug caught by noticing an implausible ~44% "unresolvable" rate mid-run:
+  CrossRef was rate-limiting (HTTP 429) under the original 24-worker concurrency despite the polite
+  pool `mailto` param, and the code treated *any* non-200 response as "unresolvable" — silently
+  mislabeling thousands of real, valid DOIs as fake. Fixed with real retry-with-backoff on 429 (a
+  separate `rate_limited` bucket for genuine post-retry failures, never conflated with
+  "unresolvable") and empirically-tuned concurrency (tested 10/14/18 workers live, settled on 16 —
+  the true post-fix unresolvable rate is 0.1%, not 44%).
 
 ### Structure search/comparison tools (used for tool-calling examples, not bulk downloads)
-- **FoldSeek**, **Dali server**, RCSB **1D Coordinate Server** / **Sequence Coordinates API**.
+- **Foldseek** ✅ **implemented as a local tool** (round 4, `gen_foldseek_neighbors`) — precompiled
+  universal macOS binary from GitHub releases (not available via brew/conda on this machine). A
+  local database was built once over the full 256,444-file mmCIF pool (`scripts/
+  build_foldseek_db.py`) — `createdb` took ~8 minutes for the full pool (742% CPU, all cores; a
+  200-file smoke test first suggested ~12-15 min, so this landed faster than estimated), giving
+  genuine offline structural-neighbor search against chatPDB's own corpus, not an external API call.
+- **US-align** ✅ **implemented as a local tool** (round 4, `gen_usalign_pairwise`) — installed via
+  `brew install brewsci/bio/usalign` (confirmed live and current; no precompiled binary or GitHub
+  releases exist upstream, brew was the only real option). Accurate pairwise TM-score/RMSD,
+  complementing Foldseek's fast corpus-wide search.
+- **fpocket** ✅ **implemented as a local tool** (round 4, `gen_fpocket_druggability`) — installed
+  via `brew install brewsci/bio/fpocket` (confirmed active, non-deprecated tap). Accepts mmCIF
+  natively (no gemmi conversion needed, unlike FreeSASA/PLIP), real pocket detection + druggability
+  scoring.
+- **cctbx/MolProbity** — attempted (round 4, per Marc's explicit decision to take on the install
+  friction) for independent local Ramachandran/rotamer recomputation
+  (`gen_geometry_recompute_disagreement`), scoped via `bootstrap.py --builder=molprobity` (the
+  correct scoped builder, not the full cctbx/phenix suite). **Abandoned after 3 attempts** — every
+  attempt failed on the same persistent error (`RPC failed; curl 92 HTTP/2 stream 5 was not closed
+  cleanly: CANCEL`) partway through cloning `cctbx_project`/`cbflib`, including after forcing
+  `git config --global http.version HTTP/1.1` (the standard workaround for this exact error class).
+  This looks like a genuine, unresolved network-transport issue on this machine/connection for
+  large git clones specifically, not a cctbx-side problem — worth revisiting from a different
+  network in a future round. The generator gracefully returns `[]` without it; nothing else in this
+  round depended on it.
+- **Dali server**, RCSB **1D Coordinate Server** / **Sequence Coordinates API** — not pursued
+  (Foldseek + US-align cover the structural-comparison need locally and offline).
 
 **Access protocols summary:** REST/JSON covers most of the above; GraphQL for RCSB's cross-level
 queries; bulk FTP/rsync for wwPDB derived data, AlphaFold DB, and EMDB archives; SPARQL optionally
@@ -632,9 +754,96 @@ landing at 97% of target with the lowest rejection rate of any round (1.2%). The
 ~4.5 hours (execution-verified DSSP calls against the unfiltered 256k-file structure pool dominate —
 confirmed via `sample`-based process profiling that it was genuinely executing `mkdssp` subprocesses
 throughout, not hung; some structures in the full pool are far larger than round 1's size-capped
-sample). `corpus_lookup.py`'s registry and the RAG corpus (now 22 files / 79,235 chunks, up from
+sample). `corpus_lookup.py`'s registry and the RAG corpus (round 3: 22 files / 79,235 chunks, up from
 18 / 65,811) were updated with all four new source files. Full narrative, class balance, and token
 stats in `data/README.md`'s v3 entry.
+
+**Round 4 (2026-07-17): a Fable 5 brainstorm ("what's still missing to make this a genuine
+protein-structure expert"), implemented in full, plus AlphaFraud integration and a ChemSage
+corpus-merge decision.** Explicit pre-Phase-4 work, same framing as round 3. Full source detail in
+§4 above; summary of what shipped:
+
+- **Seven new corpus sources**: PDB-REDO (195,194 entries, real re-refinement R-free deltas), EMDB
+  (34,856 entries matched, map-level metadata for the now-dominant cryo-EM method), SCOP2 (67,083
+  domain-level rows, fold/superfamily/family descriptions), MobiDB (29,190 accessions with real
+  disorder data), OPM (15,013 entries, membrane bilayer placement), RCSB sequence-identity clusters
+  (all 7 thresholds, 30–100%), and obsolete/superseded entry mapping (6,103 entries) — the last two
+  weren't in the original brainstorm, found while scoping "structural biography."
+- **AlphaFraud integration, staged**: real TM-score/GDT-TS/lDDT/CA-RMSD/FRAUD-score comparison data
+  from Marc's sibling project, replacing round 3's thin pLDDT-only comparison. AlphaFraud's own
+  historical backfill is still running server-side, so this round's pull captured only 8 rows —
+  re-run with default args once it completes.
+- **Independent DOI/citation verification**: every citation-bearing entry checked against CrossRef
+  + PubMed at build time, not trusted as deposited — directly answers Marc's "supported by real DOI
+  checked references" ask. 109,542 citations verified: 97,283 confirmed, 4,893 flagged as
+  mismatched, 108 genuinely unresolvable.
+- **Five new local tool-exec integrations**: FreeSASA (real buried-interface-area computation, the
+  practical substitute for the still-impractical-to-bulk-download PISA API), fpocket (real pocket
+  detection + druggability scoring), Foldseek (a local database built over the full 256,444-file
+  mmCIF pool — genuine offline structural-neighbor search against chatPDB's own corpus), US-align
+  (accurate pairwise TM-score/RMSD), and PLIP (real protein-ligand interaction fingerprints).
+  cctbx/MolProbity was attempted per Marc's explicit "install it anyway" decision but abandoned
+  after 3 failed attempts, all on the same persistent network error mid-clone — the corresponding
+  generator gracefully returns `[]` without it.
+- **~34 new generators**: the house "structure report card" format (the cheapest, highest
+  perceived-expertise item of the round), family/homolog-level reasoning, structural biography
+  (a UniProt's full PDB history over time), assembly biography (real FreeSASA-backed biological-vs-
+  crystallographic interface judgment), self-consistency checks, mutation/variant-effect refusal
+  reinforcement, and a small (12-target) disease→target→structures→ligands→clinical-relevance chain
+  built by calling the ClinicalTrials MCP tool directly during this session (Open Targets was
+  rate-limited throughout the session, so Pharos's existing disease associations were used instead).
+- **ChemSage corpus merge — decided against.** Marc asked whether merging in ChemSage's corpus
+  would make chatPDB "the mother of all corpuses." No: ChemSage's corpus is molecule-centric
+  (SMILES/Lipinski/reaction-enumeration/ChEMBL/PubChem), genuinely orthogonal to protein-structure
+  expertise, and training on it would dilute chatPDB's focused identity for no structure-relevant
+  benefit — a real multi-task fine-tuning tradeoff, not just a data-hygiene preference. The one
+  genuinely relevant piece, PLIP, was pulled in on its own merit above, not as part of a corpus copy.
+
+**Six real bugs found and fixed this round**, three of them serious enough to have corrupted data
+if shipped:
+1. **PDB-REDO rsync stall.** The original approach (`rsync://rsync.pdb-redo.eu/`) dry-run tested
+   correctly but the real full-tree pull silently stalled — an ESTABLISHED TCP connection, ~0 CPU,
+   zero files written after 25+ minutes. Switched to HTTP per-entry fetches against this corpus's
+   own known PDB IDs instead of having rsync enumerate PDB-REDO's tree.
+2. **AlphaFraud's "timeout" fix didn't actually fix anything.** A `ThreadPoolExecutor(max_workers=1)`
+   reused across a loop with `future.result(timeout=...)` stops the *caller* waiting on a stuck
+   request but never frees the pool's only worker thread — every subsequent submission queued
+   behind it forever (looked exactly like a hang: ESTABLISHED socket, ~0 CPU, no progress for over
+   an hour). Real fix: a throwaway single-worker executor per request, abandoned (not joined) on
+   timeout.
+3. **EMDB's search-based pull had no real termination condition.** `api/search/*` pagination was
+   assumed to return one document per entry; live mid-run evidence (still-valid, non-duplicate EMDB
+   IDs appearing past a 350,000 offset against a real total of 59,608) proved the search index
+   returns far more documents than that, producing unbounded duplicate matches. Fixed by switching
+   to the bulk holdings index for the definitive ID list, then per-entry REST calls.
+4. **`verify_citations.py` crashed on a NaN citation_year**, the same "pandas NaN is not `None`"
+   bug class this project has hit before, this time in a file that hadn't yet absorbed the lesson —
+   `year is None` (and the parallel `if title` truthiness check, since a NaN float is truthy in
+   Python) both silently missed real NaN values and crashed the run partway through. This is also
+   the real explanation for a run that "looked stuck" at the same checkpoint for over an hour: it
+   had actually crashed early, and stale monitoring kept re-reading an unchanging log.
+5. **CrossRef rate-limiting silently corrupted citation-verification data.** Caught only by
+   noticing an implausible ~44% "unresolvable" rate mid-run — CrossRef was returning HTTP 429 under
+   24-worker concurrency despite the polite-pool `mailto` param, and the code treated *any*
+   non-200 response as "this DOI doesn't exist," which would have taught the model that huge
+   fractions of real PDB citations are fake. Fixed with real retry-with-backoff on 429, a separate
+   `rate_limited` bucket never conflated with genuine unresolvability, and empirically-tuned
+   concurrency (10/14/18 workers tested live, settled on 16 — true post-fix unresolvable rate: 0.1%).
+6. **OPM's original sequential puller would have taken ~8 hours** for 15,014 entries (~1.8s/request
+   against a GCS-backed host with per-request TLS handshake overhead) — switched to concurrent
+   fetching, same pattern as every other multi-request downloader, finished in 24 minutes.
+
+**Result: 93,725 examples** (74,981 train / 9,372 valid / 9,372 test), 2.7% rejection rate. The
+full run took **~8.5 hours** — confirmed via repeated `sample`-based process profiling and direct
+child-process inspection (caught `fpocket` and other real subprocesses mid-execution, not hung)
+that this was genuine compute, not a stall: the new execution-verified tool-calling generators
+(especially fpocket, whose exhaustive Voronoi-based pocket search has a real long tail on larger
+structures) dominate the runtime far more than round 3's DSSP-only tool_calling class did. Landed
+short of the 100,000 target (94%) — reported honestly rather than padded, same discipline as every
+round. Flagged the realistic timeline mid-run and confirmed with Marc to let it run to full
+completion rather than truncate. `corpus_lookup.py`'s registry and the RAG corpus (now includes all
+round 4 source files) were updated. Full narrative, class balance, and token stats in
+`data/README.md`'s v4 entry.
 
 ### Phase 4 — QLoRA fine-tune with MLX-LM (0.5–1 day of compute)
 `config/train_config.yaml` seeded from chem_sage's validated field names and values (rank, RSLoRA,

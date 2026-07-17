@@ -115,6 +115,36 @@ REGISTRY: list[CorpusFile] = [
     CorpusFile("string_interactions.csv", "uniprot",
                ["protein_name", "partner_name", "combined_score"],
                subdir="string", case_insensitive=False),
+    # Round 4 sources: PDB-REDO, EMDB, SCOP2, MobiDB, OPM, obsolete entries, AlphaFraud
+    # (staged/partial), citation verification.
+    CorpusFile("pdbredo_metadata.csv", "pdb_id",
+               ["rfact", "rfree", "rffin", "rffinunb", "rffinz", "sigrffin", "dataresh",
+                "spacegroup", "wavelength", "version", "bnet"],
+               subdir="pdbredo"),
+    CorpusFile("emdb_map_metadata.csv", "pdb_id",
+               ["emdb_id", "method", "resolution_A", "resolution_method", "contour_level",
+                "pixel_spacing_x_A", "space_group", "dim_col", "dim_row", "dim_sec"],
+               subdir="emdb"),
+    CorpusFile("scop2_domain_names.csv", "pdb_id",
+               ["chain", "level", "node_id", "node_name", "fold_name", "class_name"],
+               subdir="scop2"),
+    CorpusFile("mobidb_disorder.csv", "accession",
+               ["length", "source", "content_fraction", "content_count", "regions"],
+               subdir="mobidb", case_insensitive=False),
+    CorpusFile("opm_membrane_placement.csv", "pdb_id",
+               ["half_bilayer_thickness_A", "has_membrane_dummy_atoms"],
+               subdir="opm"),
+    CorpusFile("obsolete_entries.csv", "obsolete_id",
+               ["removed_date", "superseded_by", "title"],
+               subdir="obsolete"),
+    # AlphaFraud comparisons are keyed by PDB entry_id, staged/partial (backfill still running).
+    CorpusFile("alphafraud_comparisons.csv", "entry_id",
+               ["uniprot", "uniprot_name", "resolution", "method", "tm_by_experiment", "lddt",
+                "gdt_ts", "ca_rmsd", "fraud_score", "confidently_wrong", "mean_plddt", "is_novel"],
+               subdir="alphafraud"),
+    CorpusFile("citation_verification.csv", "doi",
+               ["bucket", "crossref_title", "title_similarity", "pmid_doi_match"],
+               subdir="citations", case_insensitive=False),
 ]
 
 _cache: dict[str, pd.DataFrame] = {}

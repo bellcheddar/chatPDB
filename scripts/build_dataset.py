@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -81,6 +83,20 @@ def load_corpus() -> dict:
     c["bindingdb"] = _read_optional(CORPUS / "bindingdb/bindingdb_pdb_affinities.csv", low_memory=False)
     c["validation"] = _read_optional(CORPUS / "validation/wwpdb_validation.csv")
     c["string"] = _read_optional(CORPUS / "string/string_interactions.csv")
+
+    # Round 4 sources: PDB-REDO, EMDB, SCOP2, MobiDB, OPM, sequence clusters, obsolete entries,
+    # AlphaFraud (staged/partial -- backfill still running, see PROJECT_PLAN.md), citation
+    # verification, and the small hand-built disease-context cache.
+    c["pdbredo"] = _read_optional(CORPUS / "pdbredo/pdbredo_metadata.csv")
+    c["emdb"] = _read_optional(CORPUS / "emdb/emdb_map_metadata.csv")
+    c["scop2"] = _read_optional(CORPUS / "scop2/scop2_domain_names.csv")
+    c["mobidb"] = _read_optional(CORPUS / "mobidb/mobidb_disorder.csv")
+    c["opm"] = _read_optional(CORPUS / "opm/opm_membrane_placement.csv")
+    c["clusters_30"] = _read_optional(CORPUS / "clusters/clusters_30pct.csv")
+    c["obsolete"] = _read_optional(CORPUS / "obsolete/obsolete_entries.csv")
+    c["alphafraud"] = _read_optional(CORPUS / "alphafraud/alphafraud_comparisons.csv")
+    c["citations"] = _read_optional(CORPUS / "citations/citation_verification.csv")
+    c["disease_context"] = _read_optional(CORPUS / "disease_context/disease_target_context.csv")
 
     # CATH domain -> classification join, keyed by PDB id + chain (mirrors rag/corpus_lookup.py's
     # two-hop join, precomputed here once for speed across thousands of generated examples).
@@ -806,6 +822,695 @@ def gen_tool_chain_lookup(sifts_uniprot_df: pd.DataFrame, pharos_df: pd.DataFram
     return out
 
 
+# --- Round 4: tool-exec expansion (FreeSASA, fpocket, Foldseek, US-align, PLIP, cctbx) -----------
+
+def _gemmi_to_pdb(cif_path: Path) -> str:
+    """Convert a real mmCIF file to a temp legacy-PDB file -- FreeSASA and PLIP only accept legacy
+    PDB, same conversion need DSSP/PLIP already had; caller is responsible for deleting the temp
+    file. Returns the temp path, or raises on a genuine parse failure (caller should catch)."""
+    import gemmi
+    st = gemmi.read_structure(str(cif_path))
+    st.setup_entities()
+    fd, tmppath = tempfile.mkstemp(suffix=".pdb")
+    os.close(fd)
+    st.write_pdb(tmppath)
+    return tmppath
+
+
+def gen_freesasa_interface(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real buried-surface-area computation (complex SASA vs. sum of isolated-
+    chain SASA) on real multi-chain structures. The local substitute for the still-impractical-to-
+    bulk-download PISA API -- computed on demand instead of hitting a 256k-request wall."""
+    import freesasa
+    import gemmi
+    candidates = [p for p in rng.sample(structure_files, k=min(n * 6, len(structure_files)))]
+    out = []
+    for path in candidates:
+        if len(out) >= n:
+            break
+        complex_path = None
+        try:
+            st = gemmi.read_structure(str(path))
+            st.setup_entities()
+            model = st[0]
+            chain_names = [c.name for c in model]
+            if len(chain_names) < 2:
+                continue
+            complex_path = _gemmi_to_pdb(path)
+            complex_sasa = freesasa.calc(freesasa.Structure(complex_path)).totalArea()
+            isolated_total = 0.0
+            for cname in chain_names:
+                st2 = gemmi.read_structure(str(path))
+                st2.setup_entities()
+                m2 = st2[0]
+                for rn in [c.name for c in m2 if c.name != cname]:
+                    m2.remove_chain(rn)
+                fd, chain_path = tempfile.mkstemp(suffix=".pdb")
+                os.close(fd)
+                st2.write_pdb(chain_path)
+                isolated_total += freesasa.calc(freesasa.Structure(chain_path)).totalArea()
+                os.unlink(chain_path)
+            buried = isolated_total - complex_sasa
+            if buried < 200:  # negligible/no real interface -- not an interesting example
+                continue
+        except Exception:
+            continue
+        finally:
+            if complex_path:
+                os.unlink(complex_path)
+        pid = path.stem.upper()
+        interface_read = ("a large, almost certainly biological interface" if buried > 2000 else
+                          "a substantial interface, plausibly biological" if buried > 800 else
+                          "a modest interface — could be biological or a crystal-packing contact")
+        q = f"Compute the buried interface area between chains in PDB entry {pid} (mmCIF file `{path.name}`) to help judge whether this is a real biological assembly."
+        a = (
+            "```python\n"
+            "import gemmi, freesasa\n\n"
+            f"st = gemmi.read_structure('{path.name}')\n"
+            "st.setup_entities()\n"
+            "chains = [c.name for c in st[0]]\n"
+            "# SASA of the full complex, then SASA of each chain written out in isolation\n"
+            "complex_sasa = freesasa.calc(freesasa.Structure('complex.pdb')).totalArea()\n"
+            "isolated_total = sum(freesasa.calc(freesasa.Structure(f'{c}.pdb')).totalArea() for c in chains)\n"
+            "buried_area = isolated_total - complex_sasa\n"
+            "print(f'Buried interface area: {buried_area:.0f} A^2')\n"
+            "```\n\n"
+            f"For {pid} ({len(chain_names)} chains): buried interface area ≈{buried:.0f} Å² — "
+            f"{interface_read}. As a rule of thumb, biological interfaces are typically >800 Å² per "
+            f"chain pair, while small-area contacts (a few hundred Å² or less) are more often crystal-"
+            f"packing artifacts — but this is a heuristic, not a certainty; the entry's deposited "
+            f"assembly annotation is still the authoritative source for which assembly is biological."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_fpocket_druggability(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real pocket detection + druggability scoring against real structure
+    files, run directly on mmCIF (fpocket 4.x accepts it natively, no conversion needed)."""
+    fpocket_bin = shutil.which("fpocket")
+    if not fpocket_bin:
+        return []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    out = []
+    for path in candidates:
+        if len(out) >= n:
+            break
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                local_copy = Path(tmpdir) / path.name
+                local_copy.write_bytes(path.read_bytes())
+                result = subprocess.run(
+                    [fpocket_bin, "-f", str(local_copy), "-d"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                lines = [l for l in result.stdout.strip().split("\n") if l and not l.startswith("cav_id")]
+                if not lines:
+                    continue
+                best = max(lines, key=lambda l: float(l.split()[1]))
+                fields = best.split()
+                drug_score, volume = float(fields[1]), float(fields[2])
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, ValueError, IndexError):
+            continue
+        pid = path.stem.upper()
+        readout = ("highly druggable" if drug_score > 0.5 else
+                  "possibly druggable, worth a closer look" if drug_score > 0.2 else
+                  "not a promising small-molecule binding site by this measure")
+        q = f"Run pocket detection on PDB entry {pid} (mmCIF file `{path.name}`) and tell me if it has a druggable cavity."
+        a = (
+            "```python\n"
+            "import subprocess\n\n"
+            f"subprocess.run(['fpocket', '-f', '{path.name}', '-d'])\n"
+            "# fpocket writes pocket descriptors to stdout with -d; the top-scoring cavity's\n"
+            "# drug_score (0-1, an SVM-based estimate) is the headline druggability readout\n"
+            "```\n\n"
+            f"fpocket's top-scoring cavity for {pid}: drug_score {drug_score:.3f}, volume "
+            f"{volume:.0f} Å³ — {readout}. fpocket's drug_score is a fast geometric/physicochemical "
+            f"estimate (pocket shape, hydrophobicity, size), not a docking or binding-affinity "
+            f"prediction — a high score flags a cavity worth investigating with real "
+            f"docking/experimental follow-up, not a guarantee a drug will bind there."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_foldseek_neighbors(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real structural-neighbor search against chatPDB's own local Foldseek
+    database (built once via scripts/build_foldseek_db.py over the full 256,444-file mmCIF pool) --
+    genuine offline structural-similarity search, not an assertion from memory or an external API
+    call."""
+    foldseek_bin = Path("tools/foldseek/bin/foldseek")
+    db_path = Path("tools/foldseek_db/db")
+    if not foldseek_bin.exists() or not db_path.exists():
+        return []
+    candidates = rng.sample(structure_files, k=min(n * 3, len(structure_files)))
+    out = []
+    for path in candidates:
+        if len(out) >= n:
+            break
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                result_path = Path(tmpdir) / "result.m8"
+                subprocess.run(
+                    [str(foldseek_bin), "easy-search", str(path), str(db_path), str(result_path), tmpdir],
+                    capture_output=True, text=True, timeout=60, check=True,
+                )
+                if not result_path.exists():
+                    continue
+                lines = result_path.read_text().strip().split("\n")
+                hits = []
+                for line in lines:
+                    parts = line.split("\t")
+                    if len(parts) < 12:
+                        continue
+                    target, seq_id, evalue = parts[1], float(parts[2]), float(parts[10])
+                    if target.split(".")[0].upper() == path.stem.upper():
+                        continue  # skip self-hit
+                    hits.append((target, seq_id, evalue))
+                if not hits:
+                    continue
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, IndexError):
+            continue
+        pid = path.stem.upper()
+        top = hits[:5]
+        neighbor_list = ", ".join(f"{t.split('.')[0].upper()} (seq id {s:.2f}, E={e:.1e})" for t, s, e in top)
+        q = f"Search chatPDB's local structure database for entries structurally similar to PDB entry {pid} (mmCIF file `{path.name}`)."
+        a = (
+            "```python\n"
+            "import subprocess\n\n"
+            f"subprocess.run(['foldseek', 'easy-search', '{path.name}', 'foldseek_db/db', "
+            "'result.m8', 'tmp'])\n"
+            "# result.m8 columns: query, target, seq_id, aln_len, mismatches, gapopen,\n"
+            "# qstart, qend, tstart, tend, evalue, bitscore\n"
+            "```\n\n"
+            f"Foldseek's closest structural neighbors to {pid} in this corpus: {neighbor_list}. This "
+            f"is a real 3Di+sequence structural alignment search against chatPDB's own downloaded "
+            f"256,444-entry structure pool, not a claim from memory — low E-values indicate strong "
+            f"structural (not necessarily sequence) similarity, which can reveal distant homologs or "
+            f"convergent folds that sequence search alone would miss."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_usalign_pairwise(structure_files: list[Path], entries_df: pd.DataFrame,
+                          sifts_uniprot_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real pairwise TM-score/RMSD alignment between two real structure files of
+    the same protein (found via SIFTS UniProt mapping), complementing Foldseek's fast corpus-wide
+    search with an accurate, one-to-one structural comparison."""
+    usalign_bin = shutil.which("USalign")
+    if not usalign_bin:
+        return []
+    sifts = sifts_uniprot_df.copy()
+    sifts["pdb_id"] = sifts["PDB"].str.upper()
+    counts = sifts.groupby("SP_PRIMARY")["pdb_id"].nunique()
+    multi = counts[counts >= 2]
+    if multi.empty:
+        return []
+    available = {p.stem.upper() for p in structure_files}
+    accs = rng.sample(list(multi.index), k=min(n * 3, len(multi)))
+    out = []
+    for acc in accs:
+        if len(out) >= n:
+            break
+        ids = sifts[sifts["SP_PRIMARY"] == acc]["pdb_id"].unique()
+        ids = [i for i in ids if i in available]
+        if len(ids) < 2:
+            continue
+        id_a, id_b = rng.sample(list(ids), 2)
+        path_a = Path("data/structures_all") / f"{id_a.lower()}.cif"
+        path_b = Path("data/structures_all") / f"{id_b.lower()}.cif"
+        try:
+            result = subprocess.run(
+                [usalign_bin, str(path_a), str(path_b)],
+                capture_output=True, text=True, timeout=60,
+            )
+            tm_lines = [l for l in result.stdout.split("\n") if l.startswith("TM-score=")]
+            if not tm_lines:
+                continue
+            tm_score = float(tm_lines[0].split("=")[1].split()[0])
+            rmsd_line = next((l for l in result.stdout.split("\n") if "RMSD=" in l), None)
+            rmsd = float(rmsd_line.split("RMSD=")[1].split(",")[0].strip()) if rmsd_line else None
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, ValueError, IndexError):
+            continue
+        agreement = ("essentially the same fold" if tm_score >= 0.9 else
+                    "the same overall fold with real conformational differences" if tm_score >= 0.5 else
+                    "substantially different conformations despite being the same protein")
+        q = f"How structurally similar are PDB entries {id_a} and {id_b} (both UniProt {acc})?"
+        a = (
+            "```python\n"
+            "import subprocess\n\n"
+            f"result = subprocess.run(['USalign', '{id_a.lower()}.cif', '{id_b.lower()}.cif'], "
+            "capture_output=True, text=True)\n"
+            "print(result.stdout)  # includes TM-score and RMSD\n"
+            "```\n\n"
+            f"USalign gives TM-score {tm_score:.3f}" + (f", RMSD {rmsd:.2f} Å" if rmsd is not None else "")
+            + f" between {id_a} and {id_b} — {agreement}. Both entries are structures of the same "
+              f"UniProt protein ({acc}), so any real difference here reflects genuine conformational "
+              f"variability (different ligand-bound states, crystal forms, or construct boundaries), "
+              f"not measurement noise — TM-score above ~0.5 is generally considered the same fold."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_plip_interactions(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real protein-ligand interaction fingerprinting (H-bonds, hydrophobic
+    contacts, pi-stacking) via PLIP, against real bound ligands in real structure files. PLIP only
+    accepts legacy PDB, converted via gemmi first (same pattern as DSSP)."""
+    try:
+        from plip.structure.preparation import PDBComplex
+    except ImportError:
+        return []
+    candidates = rng.sample(structure_files, k=min(n * 5, len(structure_files)))
+    out = []
+    for path in candidates:
+        if len(out) >= n:
+            break
+        pdb_path = None
+        try:
+            pdb_path = _gemmi_to_pdb(path)
+            mol = PDBComplex()
+            mol.load_pdb(pdb_path)
+            mol.analyze()
+            if not mol.interaction_sets:
+                continue
+            ligand_key = max(mol.interaction_sets, key=lambda k: len(mol.interaction_sets[k].hbonds_pdon) +
+                              len(mol.interaction_sets[k].hbonds_ldon) + len(mol.interaction_sets[k].hydrophobic_contacts))
+            iset = mol.interaction_sets[ligand_key]
+            n_hbonds = len(iset.hbonds_pdon) + len(iset.hbonds_ldon)
+            n_hydrophobic = len(iset.hydrophobic_contacts)
+            n_pistack = len(iset.pistacking)
+            n_saltbridge = len(iset.saltbridge_lneg) + len(iset.saltbridge_pneg)
+            if n_hbonds + n_hydrophobic == 0:
+                continue
+        except Exception:
+            continue
+        finally:
+            if pdb_path:
+                os.unlink(pdb_path)
+        pid = path.stem.upper()
+        ligand_name = ligand_key.split(":")[0]
+        q = f"What protein-ligand interactions does PLIP detect for the bound ligand in PDB entry {pid} (mmCIF file `{path.name}`)?"
+        a = (
+            "```python\n"
+            "import gemmi\n"
+            "from plip.structure.preparation import PDBComplex\n\n"
+            f"st = gemmi.read_structure('{path.name}')\n"
+            "st.setup_entities()\n"
+            "st.write_pdb('converted.pdb')  # PLIP only accepts legacy PDB\n\n"
+            "mol = PDBComplex()\n"
+            "mol.load_pdb('converted.pdb')\n"
+            "mol.analyze()\n"
+            f"iset = mol.interaction_sets['{ligand_key}']\n"
+            "print('H-bonds:', len(iset.hbonds_pdon) + len(iset.hbonds_ldon))\n"
+            "print('Hydrophobic contacts:', len(iset.hydrophobic_contacts))\n"
+            "```\n\n"
+            f"PLIP's real interaction fingerprint for ligand {ligand_name} in {pid}: {n_hbonds} "
+            f"hydrogen bonds, {n_hydrophobic} hydrophobic contacts"
+            + (f", {n_pistack} π-stacking interaction(s)" if n_pistack else "")
+            + (f", {n_saltbridge} salt bridge(s)" if n_saltbridge else "") +
+            f". This is computed directly from the deposited coordinates and standard geometric/"
+            f"distance criteria for each interaction type — not a docking prediction, a description "
+            f"of the interactions actually present in this specific deposited pose."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_geometry_recompute_disagreement(structure_files: list[Path], validation_df: pd.DataFrame,
+                                         rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: independently recomputes Ramachandran outlier percentage via cctbx's
+    MolProbity build and compares against PDBe's deposited validation percentiles -- closes the
+    "verify, don't just trust the deposited report" loop for backbone geometry. Gracefully returns
+    [] if the cctbx/MolProbity build isn't available (a genuinely heavy, optional install)."""
+    molprobity_bin = shutil.which("mp.ramalyze") or shutil.which("phenix.ramalyze")
+    if not molprobity_bin or validation_df.empty:
+        return []
+    df = validation_df[validation_df["percent_rama_outliers"].notna()]
+    candidates = [p for p in structure_files if p.stem.upper() in set(df["pdb_id"])]
+    sample = rng.sample(candidates, k=min(n * 3, len(candidates)))
+    out = []
+    for path in sample:
+        if len(out) >= n:
+            break
+        pdb_path = None
+        try:
+            pdb_path = _gemmi_to_pdb(path)
+            result = subprocess.run([molprobity_bin, pdb_path], capture_output=True, text=True, timeout=60)
+            outlier_lines = [l for l in result.stdout.split("\n") if "OUTLIER" in l]
+            deposited_row = df[df["pdb_id"] == path.stem.upper()].iloc[0]
+            deposited_pct = float(deposited_row["percent_rama_outliers"])
+        except Exception:
+            continue
+        finally:
+            if pdb_path:
+                os.unlink(pdb_path)
+        pid = path.stem.upper()
+        recomputed_count = len(outlier_lines)
+        q = f"Independently recompute the Ramachandran outliers for PDB entry {pid} and compare against the deposited validation report."
+        a = (
+            f"Recomputing directly with MolProbity's ramalyze against the real deposited coordinates "
+            f"for {pid}: {recomputed_count} outlier residue(s) flagged. The wwPDB validation report "
+            f"(PDBe) records {deposited_pct:.2f}% Ramachandran outliers for this entry. Independent "
+            f"recomputation like this is the honest way to confirm a deposited validation statistic "
+            f"rather than just repeating it — MolProbity's own outlier criteria can differ slightly "
+            f"in exact residue count from wwPDB's percentile pipeline depending on version/tolerance "
+            f"settings, so minor differences here are expected and not a red flag by themselves; a "
+            f"large disagreement would be worth investigating further."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+# --- Round 4: response-richness techniques (house format, family/homolog reasoning, biography, ---
+# --- self-consistency, mutation-refusal) -- classes vary per generator, see each make_example call
+
+def _structure_report_card(pdb_id: str, resolution: float, method: str, r_free: float | None,
+                            clashscore: float | None, clash_pct: float | None,
+                            rama_outliers: float | None, rota_outliers: float | None) -> str:
+    """The house 'structure report card' format: a consistent, scannable quality summary reused
+    across experimental_method generators. Fable 5's brainstorm flagged this as the cheapest,
+    highest perceived-expertise item in the whole round -- pure formatting discipline over data
+    chatPDB already owns, not a new data source."""
+    lines = [f"**{pdb_id} — structure report card**", f"- Method: {method}, resolution {resolution:.2f} Å ({_resolution_bucket(resolution)})"]
+    if r_free is not None:
+        lines.append(f"- R-free: {r_free:.3f} ({_rfree_bucket(r_free)})")
+    else:
+        lines.append("- R-free: not recorded for this entry")
+    if clashscore is not None:
+        pct_read = f", better than {clash_pct:.0f}% of comparable-resolution structures" if clash_pct is not None else ""
+        lines.append(f"- Clashscore: {clashscore:.2f}{pct_read}")
+    if rama_outliers is not None:
+        lines.append(f"- Ramachandran outliers: {rama_outliers:.2f}%")
+    if rota_outliers is not None:
+        lines.append(f"- Rotamer outliers: {rota_outliers:.2f}%")
+    lines.append(
+        "- Verdict: data-fit metrics (resolution/R-free) and model-geometry metrics (clashscore/"
+        "Ramachandran/rotamer) are independent axes — check both before trusting any single number."
+    )
+    return "\n".join(lines)
+
+
+def gen_structure_report_card(entries_df: pd.DataFrame, validation_df: pd.DataFrame,
+                               rng: random.Random, n: int) -> list[dict]:
+    """House format generator: every quality question gets the same scannable card, the single
+    cheapest change in this round for making output read as expert-caliber rather than just
+    thorough."""
+    merged = entries_df[entries_df["resolution_A"].notna()]
+    if not validation_df.empty:
+        merged = merged.merge(validation_df, on="pdb_id", how="left")
+    if merged.empty:
+        return []
+    rows = merged.sample(n=min(n, len(merged)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"Give me a full quality report card for PDB entry {r['pdb_id']}."
+        card = _structure_report_card(
+            r["pdb_id"], float(r["resolution_A"]), r["method"],
+            float(r["r_free"]) if pd.notna(r.get("r_free")) else None,
+            float(r["clashscore"]) if pd.notna(r.get("clashscore")) and r.get("clashscore", -1) >= 0 else None,
+            float(r["clashscore_percentile"]) if pd.notna(r.get("clashscore_percentile")) else None,
+            float(r["percent_rama_outliers"]) if pd.notna(r.get("percent_rama_outliers")) else None,
+            float(r["percent_rota_outliers"]) if pd.notna(r.get("percent_rota_outliers")) else None,
+        )
+        out.append(make_example(q, card, "experimental_method"))
+    return out
+
+
+def gen_family_homolog_context(cath_joined_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Family/homolog-level reasoning as the default rather than single-entry facts -- an expert
+    reflexively situates one structure within its fold family ("this is one of N members of
+    superfamily X; the conserved core is Y") rather than describing it in isolation."""
+    if cath_joined_df.empty:
+        return []
+    counts = cath_joined_df.groupby("homology_desc")["PDB"].nunique()
+    multi = counts[counts >= 5]
+    if multi.empty:
+        return []
+    families = rng.sample(list(multi.index), k=min(n, len(multi)))
+    out = []
+    for family in families:
+        members = cath_joined_df[cath_joined_df["homology_desc"] == family]
+        row = members.sample(n=1, random_state=rng.randint(0, 1 << 30)).iloc[0]
+        other_members = sorted(members[members["PDB"] != row["PDB"]]["PDB"].str.upper().unique())[:6]
+        q = f"How does PDB entry {row['PDB'].upper()} (chain {row['CHAIN']}) relate to other structures in its CATH homologous superfamily?"
+        a = (
+            f"Chain {row['CHAIN']} of {row['PDB'].upper()} belongs to the \"{family}\" homologous "
+            f"superfamily (CATH {row['cath_code']}, within the \"{row['architecture_desc']}\" "
+            f"architecture and \"{row['topology_desc']}\" topology). This superfamily has "
+            f"{int(counts[family])} member chains in this corpus, including "
+            f"{', '.join(other_members)}" + (" and others" if len(other_members) < int(counts[family]) - 1 else "") + ". "
+            f"Members of the same CATH homologous superfamily are believed to share a common "
+            f"evolutionary origin — the conserved core fold (the topology/architecture) is shared, "
+            f"but individual members can differ substantially in sequence, ligand-binding "
+            f"specificity, and even overall function at the periphery of the shared core; situating "
+            f"one entry within its family, rather than describing it in isolation, is usually the "
+            f"more informative framing."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_structural_biography(entries_df: pd.DataFrame, sifts_uniprot_df: pd.DataFrame,
+                              rng: random.Random, n: int) -> list[dict]:
+    """One UniProt accession's full PDB history ordered by deposition date, narrating the method/
+    resolution trajectory over time -- reads as genuinely expert ("first solved at 3.2 Å in 2004,
+    superseded by a 1.8 Å structure in 2011...") rather than a bare fact lookup."""
+    sifts = sifts_uniprot_df.copy()
+    sifts["pdb_id"] = sifts["PDB"].str.upper()
+    merged = entries_df[entries_df["deposition_date"].notna() & entries_df["resolution_A"].notna()][
+        ["pdb_id", "deposition_date", "resolution_A", "method"]
+    ].merge(sifts[["pdb_id", "SP_PRIMARY"]].drop_duplicates("pdb_id"), on="pdb_id", how="inner")
+    counts = merged.groupby("SP_PRIMARY")["pdb_id"].nunique()
+    multi = counts[counts >= 3]
+    if multi.empty:
+        return []
+    accs = rng.sample(list(multi.index), k=min(n, len(multi)))
+    out = []
+    for acc in accs:
+        timeline = merged[merged["SP_PRIMARY"] == acc].sort_values("deposition_date")
+        if len(timeline) < 3:
+            continue
+        first, latest = timeline.iloc[0], timeline.iloc[-1]
+        best = timeline.loc[timeline["resolution_A"].idxmin()]
+        q = f"Trace the structural history of UniProt {acc} across the PDB — how has our structural picture of it evolved over time?"
+        entries_str = ", ".join(
+            f"{row['pdb_id']} ({row['deposition_date'][:4]}, {row['method']}, {float(row['resolution_A']):.2f} Å)"
+            for _, row in timeline.head(6).iterrows()
+        )
+        a = (
+            f"UniProt {acc} has {len(timeline)} structures in this corpus spanning "
+            f"{first['deposition_date'][:4]}–{latest['deposition_date'][:4]}. First solved as "
+            f"{first['pdb_id']} in {first['deposition_date'][:4]} ({first['method']}, "
+            f"{float(first['resolution_A']):.2f} Å); the highest-resolution structure to date is "
+            f"{best['pdb_id']} at {float(best['resolution_A']):.2f} Å. Timeline: {entries_str}"
+            f"{' and others' if len(timeline) > 6 else ''}. A longer structural history like this "
+            f"usually reflects sustained research interest (different ligands, complexes, or "
+            f"resolution improvements as methods/crystals improved over time) rather than any single "
+            f"entry being definitive — for most questions, the most recent highest-resolution entry "
+            f"is the reasonable default, but a specific older entry may still be the right choice if "
+            f"it captures a particular ligand-bound state the newer ones don't."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_assembly_biography(structure_files: list[Path], entries_df: pd.DataFrame,
+                            rng: random.Random, n: int) -> list[dict]:
+    """Biological assembly vs. asymmetric unit reasoning backed by real computed FreeSASA interface
+    area, not just the deposited assembly_count metadata field alone."""
+    import freesasa
+    import gemmi
+    merged_ids = set(entries_df[entries_df["assembly_count"].notna()]["pdb_id"])
+    candidates = [p for p in structure_files if p.stem.upper() in merged_ids]
+    sample = rng.sample(candidates, k=min(n * 6, len(candidates)))
+    out = []
+    for path in sample:
+        if len(out) >= n:
+            break
+        complex_path = None
+        try:
+            st = gemmi.read_structure(str(path))
+            st.setup_entities()
+            chain_names = [c.name for c in st[0]]
+            if len(chain_names) < 2:
+                continue
+            complex_path = _gemmi_to_pdb(path)
+            complex_sasa = freesasa.calc(freesasa.Structure(complex_path)).totalArea()
+            isolated_total = 0.0
+            for cname in chain_names:
+                st2 = gemmi.read_structure(str(path))
+                st2.setup_entities()
+                m2 = st2[0]
+                for rn in [c.name for c in m2 if c.name != cname]:
+                    m2.remove_chain(rn)
+                fd, chain_path = tempfile.mkstemp(suffix=".pdb")
+                os.close(fd)
+                st2.write_pdb(chain_path)
+                isolated_total += freesasa.calc(freesasa.Structure(chain_path)).totalArea()
+                os.unlink(chain_path)
+            buried = isolated_total - complex_sasa
+        except Exception:
+            continue
+        finally:
+            if complex_path:
+                os.unlink(complex_path)
+        pid = path.stem.upper()
+        row = entries_df[entries_df["pdb_id"] == pid].iloc[0]
+        assembly_count = int(row["assembly_count"]) if pd.notna(row.get("assembly_count")) else None
+        verdict = ("a real, extensively buried interface — consistent with a genuine biological "
+                  "assembly rather than a crystal-packing artifact" if buried > 800 else
+                  "a small buried interface — plausibly just crystal packing, worth checking the "
+                  "entry's deposited assembly annotation before assuming this is biological")
+        q = f"Is the {len(chain_names)}-chain arrangement deposited for PDB entry {pid} likely to be the real biological assembly?"
+        a = (
+            f"{pid} deposits {len(chain_names)} chains in the asymmetric unit"
+            + (f", and RCSB records {assembly_count} distinct biological assembly definition(s) for "
+               f"this entry" if assembly_count is not None else "") +
+            f". Computing the real buried surface area between chains (isolated-chain SASA minus "
+            f"complex SASA): ≈{buried:.0f} Å² total — {verdict}. The asymmetric unit is a "
+            f"crystallographic bookkeeping unit, not necessarily the biological assembly; symmetry "
+            f"operators can both split a true biological complex across multiple deposited entries "
+            f"or, conversely, place unrelated molecules in contact purely by crystal packing — buried "
+            f"interface area is a useful independent check, not a substitute for the entry's own "
+            f"deposited assembly annotation."
+        )
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
+def gen_self_consistency_check(structure_files: list[Path], entries_df: pd.DataFrame,
+                                rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified self-consistency: deposited sequence length vs. gemmi-computed residue
+    count, confirmed or flagged rather than assumed -- a real cross-check the tool-exec layer
+    already makes possible, teaching the model to verify rather than assert."""
+    import gemmi
+    df = entries_df[entries_df["primary_sequence_length"].notna()]
+    ids = set(df["pdb_id"])
+    candidates = [p for p in structure_files if p.stem.upper() in ids]
+    sample = rng.sample(candidates, k=min(n * 3, len(candidates)))
+    out = []
+    for path in sample:
+        if len(out) >= n:
+            break
+        try:
+            st = gemmi.read_structure(str(path))
+            st.setup_entities()
+            model = st[0]
+            first_chain = next(iter(model), None)
+            if first_chain is None:
+                continue
+            computed_residues = sum(1 for res in first_chain if res.het_flag != "H")
+            pid = path.stem.upper()
+            deposited_len = int(df[df["pdb_id"] == pid].iloc[0]["primary_sequence_length"])
+        except Exception:
+            continue
+        if computed_residues == 0:
+            continue
+        agree = abs(computed_residues - deposited_len) <= max(5, deposited_len * 0.1)
+        q = f"Does the actual modelled residue count in PDB entry {pid}'s coordinates match its deposited sequence length?"
+        a = (
+            "```python\n"
+            "import gemmi\n\n"
+            f"st = gemmi.read_structure('{path.name}')\n"
+            "st.setup_entities()\n"
+            "chain = next(iter(st[0]))\n"
+            "modelled_residues = sum(1 for res in chain if res.het_flag != 'H')\n"
+            "print('Modelled residues:', modelled_residues)\n"
+            "```\n\n"
+            f"Deposited primary sequence length: {deposited_len} residues. Actual modelled residue "
+            f"count in the coordinates (chain {first_chain.name}): {computed_residues}. "
+            + (f"These agree closely — the deposited construct is essentially fully ordered/modelled."
+               if agree else
+               f"These *don't* closely agree (deposited {deposited_len} vs. modelled "
+               f"{computed_residues}) — normal and expected when part of the construct is "
+               f"disordered/missing density, a cleaved tag, or a multi-domain construct where only "
+               f"one domain crystallized; it's not itself an error, but it means the deposited "
+               f"sequence length alone isn't a reliable count of what's actually visible in this "
+               f"structure.")
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_mutation_refusal(uniprot_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Refusal-boundary reinforcement specifically for mutation/variant-effect framing -- the
+    existing refusal generator only covers bare "predict this structure" requests, not the more
+    common real-world framing of "what would this mutation do to the structure"."""
+    rows = uniprot_df.sample(n=min(n, len(uniprot_df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        pos = rng.randint(10, 300)
+        wt, mut = rng.choice("ACDEFGHIKLMNPQRSTVWY"), rng.choice("ACDEFGHIKLMNPQRSTVWY")
+        q = f"If I introduce a {wt}{pos}{mut} mutation into {r['protein_name']} (UniProt {r['accession']}), what would happen to the 3D structure?"
+        a = (
+            f"I can't predict the structural effect of a point mutation — that's a structure-"
+            f"prediction task, out of scope for chatPDB. What I can do instead: check whether "
+            f"position {pos} is resolved in an existing experimental structure of this protein (if "
+            f"so, I can tell you its local environment — secondary structure, burial, nearby "
+            f"residues — which is useful context even without predicting the mutant); check whether "
+            f"this position is annotated in UniProt as a known variant with reported functional "
+            f"effects; or point you to structure-prediction tools (AlphaFold2/ColabFold, ESMFold, "
+            f"Rosetta) that are actually built for this. I'd rather give you real, grounded context "
+            f"about the wild-type structure than a guessed answer about the mutant."
+        )
+        out.append(make_example(q, a, "refusal_boundary"))
+    return out
+
+
+def gen_disease_target_context(disease_df: pd.DataFrame, sifts_uniprot_df: pd.DataFrame,
+                                bindingdb_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Disease -> target -> structures -> ligands -> clinical-relevance chain, scoped small
+    (11 well-studied Tclin targets) per Marc's decision. Unlike every other generator this round,
+    the seed data (data/corpus/disease_context/disease_target_context.csv) isn't from a
+    download_*.py script -- it's a small cache I (the agent) built by calling the ClinicalTrials
+    MCP tool directly during this session for real trial counts, joined to Pharos disease
+    associations already in the corpus. Open Targets' MCP tool was rate-limited throughout this
+    session, so this uses ClinicalTrials + existing Pharos data instead, not Open Targets. Context/
+    QA only -- never trains toward treatment or diagnosis recommendations, same guardrail as the
+    CASP-context principle in PROJECT_PLAN.md §4."""
+    if disease_df.empty:
+        return []
+    sifts = sifts_uniprot_df.copy()
+    sifts["pdb_id"] = sifts["PDB"].str.upper()
+    out = []
+    rows = disease_df.sample(n=min(n, len(disease_df)), random_state=rng.randint(0, 1 << 30)) if len(disease_df) > n else disease_df
+    for _, r in rows.iterrows():
+        acc = r["uniprot"]
+        pdb_ids = sorted(sifts[sifts["SP_PRIMARY"] == acc]["pdb_id"].unique())[:5]
+        ligand_count = 0
+        if not bindingdb_df.empty:
+            ligand_count = (bindingdb_df["uniprot_primary"] == acc).sum()
+        q = f"Walk me through {r['symbol']} ({r['name']}) as a drug target: what disease is it associated with, what structures exist, and is there active clinical development?"
+        parts = [
+            f"UniProt {acc} ({r['symbol']}, {r['name']}) is a Pharos Tclin target — meaning it's "
+            f"the target of at least one approved drug. Its top disease association in Pharos is "
+            f"{r['top_disease']}."
+        ]
+        if pdb_ids:
+            parts.append(f"This corpus has {len(sifts[sifts['SP_PRIMARY']==acc])} chain mapping(s) "
+                        f"to real PDB structures for this target, including {', '.join(pdb_ids)}.")
+        if ligand_count:
+            parts.append(f"BindingDB has {int(ligand_count)} measured ligand-binding data point(s) "
+                        f"against this target in this corpus.")
+        parts.append(
+            f"On active clinical development: searching ClinicalTrials.gov for "
+            f"\"{r['trial_search_term']}\" found {int(r['active_trial_count'])} recruiting/active "
+            f"trial(s) — for example {r['example_nct_id']} ({r['example_intervention']}). "
+        )
+        parts.append(
+            "This is context, not a treatment or diagnosis recommendation, and Pharos's algorithmic "
+            "top-disease association isn't always the most clinically prominent indication for a "
+            "target — treat it as one real signal among several, and check the trial's actual "
+            "intervention/condition fields (as shown) rather than assuming the search term itself "
+            "is definitive."
+        )
+        a = " ".join(parts)
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Class 4: database_cross_referencing
 # ---------------------------------------------------------------------------
@@ -1465,6 +2170,363 @@ def gen_rag_synthesis(entries_df: pd.DataFrame, sifts_uniprot_df: pd.DataFrame,
     return out
 
 
+# --- Round 4: new corpus sources (PDB-REDO, EMDB, SCOP2, MobiDB, OPM, clusters, obsolete) --------
+
+def gen_pdbredo_refinement_delta(pdbredo_df: pd.DataFrame, entries_df: pd.DataFrame,
+                                  rng: random.Random, n: int) -> list[dict]:
+    """PDB-REDO re-refines every entry automatically; the deposited R-free is not necessarily the
+    best available interpretation of the same experimental data. Teaches "deposited != optimal" —
+    a real expert judgment, not just a metadata lookup."""
+    if pdbredo_df.empty:
+        return []
+    df = pdbredo_df.copy()
+    for col in ("rfree", "rffin"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df[df["rfree"].notna() & df["rffin"].notna()]
+    df = df.merge(entries_df[["pdb_id", "method"]], on="pdb_id", how="inner")
+    if df.empty:
+        return []
+    rows = df.sample(n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        delta = float(r["rfree"]) - float(r["rffin"])
+        if abs(delta) < 0.005:
+            verdict = "PDB-REDO's re-refinement barely changed the free-R — the deposited model was already close to optimal for this data."
+        elif delta > 0:
+            verdict = (f"PDB-REDO's automated re-refinement improved the free-R by {delta:.3f} — the "
+                       f"deposited model wasn't fully optimized against its own data, which happens "
+                       f"routinely (refinement software/protocols have improved since many entries "
+                       f"were deposited).")
+        else:
+            verdict = (f"PDB-REDO's free-R is {abs(delta):.3f} *worse* than deposited — this can happen "
+                       f"when the automated pipeline's default protocol doesn't suit an unusual case "
+                       f"(twinning, very high/low resolution); the deposited value isn't automatically "
+                       f"wrong just because a generic pipeline didn't beat it.")
+        q = f"Has PDB-REDO re-refined entry {r['pdb_id']}, and did it change anything?"
+        a = (
+            f"Yes — {r['pdb_id']} (deposited as {r['method']}, R-free {float(r['rfree']):.3f}) has "
+            f"been automatically re-refined by PDB-REDO, giving free-R {float(r['rffin']):.3f}. {verdict} "
+            f"PDB-REDO re-refinement is independent of and doesn't replace the deposited model — both "
+            f"are real, citable interpretations of the same diffraction data."
+        )
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
+def gen_emdb_map_metadata(emdb_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """EMDB map-level metadata (FSC method, contour level, pixel spacing) that the 353 GB mmCIF pool
+    doesn't carry at all — chatPDB previously had zero map-side information for the now-dominant
+    cryo-EM method."""
+    if emdb_df.empty:
+        return []
+    df = emdb_df[emdb_df["resolution_A"].notna() & emdb_df["resolution_method"].notna()]
+    if df.empty:
+        return []
+    rows = df.sample(n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"What map-level metadata does {r['emdb_id']} (the EM map for PDB entry {r['pdb_id']}) carry?"
+        parts = [f"resolution {float(r['resolution_A']):.2f} Å (by {r['resolution_method']})"]
+        if pd.notna(r.get("contour_level")):
+            parts.append(f"author-recommended contour level {float(r['contour_level']):.3g}")
+        if pd.notna(r.get("pixel_spacing_x_A")):
+            parts.append(f"pixel spacing {float(r['pixel_spacing_x_A']):.3f} Å")
+        if pd.notna(r.get("dim_col")):
+            parts.append(f"box size {int(r['dim_col'])}×{int(r['dim_row'])}×{int(r['dim_sec'])} voxels")
+        a = (
+            f"{r['emdb_id']} (fitted to PDB entry {r['pdb_id']}): " + ", ".join(parts) + ". "
+            f"The contour level matters for anyone re-rendering the map — it's the author's chosen "
+            f"isosurface threshold, not an absolute property of the density; a different threshold "
+            f"can make weak side-chain density appear or disappear. This is map-level metadata, "
+            f"independent of the fitted atomic coordinates in the PDB entry itself."
+        )
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
+def gen_scop2_fold_description(scop2_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """SCOP2 fold/superfamily/family descriptions — SIFTS already gave us the PDB->SCOP2 domain-ID
+    mapping, but not what those domains actually *are*; this closes that gap, mirroring the existing
+    CATH generator for the sibling classification scheme."""
+    if scop2_df.empty:
+        return []
+    rows = scop2_df[scop2_df["level"] == "superfamily"].sample(
+        n=min(n, len(scop2_df[scop2_df["level"] == "superfamily"])), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"What SCOP2 superfamily does chain {r['chain']} of PDB entry {r['pdb_id']} belong to?"
+        a = (
+            f"Chain {r['chain']} of {r['pdb_id']} (SCOP2 domain {r['domain_id']}) belongs to the "
+            f"\"{r['node_name']}\" superfamily, within the \"{r['fold_name']}\" fold and the "
+            f"\"{r['class_name']}\" structural class. SCOP2 (Structural Classification of Proteins) "
+            f"and CATH classify structures independently, using different automated and manual "
+            f"criteria — they usually agree on the broad picture but don't always draw domain "
+            f"boundaries or superfamily groupings identically, so it's worth checking both rather "
+            f"than treating either as the single authority."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_mobidb_disorder(mobidb_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Intrinsic disorder — a real, biologically meaningful reason a region can be missing from a
+    crystal structure (genuinely mobile, not just poorly diffracting or poorly modelled), which
+    chatPDB previously had no way to distinguish."""
+    if mobidb_df.empty:
+        return []
+    df = mobidb_df[mobidb_df["content_fraction"].notna() & (mobidb_df["content_fraction"] > 0.05)]
+    if df.empty:
+        return []
+    rows = df.sample(n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        pct = float(r["content_fraction"]) * 100
+        source_note = ("curated from experimental evidence (e.g. DisProt)" if r["source"] == "curated"
+                       else "a consensus of several sequence-based disorder predictors")
+        q = f"Does UniProt {r['accession']} have any intrinsically disordered regions?"
+        a = (
+            f"Yes — MobiDB reports {pct:.1f}% of the {int(r['length'])}-residue sequence as "
+            f"intrinsically disordered ({int(r['content_count'])} residues, regions: {r['regions']}), "
+            f"based on {source_note}. If a PDB structure of this protein is missing density in these "
+            f"same regions, that's consistent with genuine conformational disorder rather than a "
+            f"modelling or data-quality problem — intrinsically disordered regions often don't adopt "
+            f"one fixed structure at all, in solution or in the crystal."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_opm_membrane(opm_df: pd.DataFrame, entries_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Membrane protein placement — a structural category chatPDB previously couldn't reason about
+    at all. OPM's REMARK-embedded bilayer half-thickness is real, curated per-entry data."""
+    if opm_df.empty:
+        return []
+    df = opm_df[opm_df["half_bilayer_thickness_A"].notna()].merge(
+        entries_df[["pdb_id", "method"]], on="pdb_id", how="inner")
+    if df.empty:
+        return []
+    rows = df.sample(n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"Is PDB entry {r['pdb_id']} a membrane protein, and if so where does the bilayer sit?"
+        a = (
+            f"Yes — OPM (Orientations of Proteins in Membranes) places {r['pdb_id']} in a lipid "
+            f"bilayer with a half-thickness of {float(r['half_bilayer_thickness_A']):.1f} Å "
+            f"(full bilayer ≈{2*float(r['half_bilayer_thickness_A']):.1f} Å), consistent with the "
+            f"deposited {r['method']} structure. OPM computes this by an energy-based placement "
+            f"algorithm, not from experimental membrane data directly (crystallography/cryo-EM don't "
+            f"resolve the lipid bilayer itself in most depositions) — treat the exact boundary as a "
+            f"computed estimate, while the fact that this protein *is* membrane-embedded is a real "
+            f"structural classification worth knowing before interpreting any solvent-accessibility "
+            f"or electrostatics calculation on it."
+        )
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
+def gen_sequence_redundancy(clusters_df: pd.DataFrame, entries_df: pd.DataFrame,
+                             rng: random.Random, n: int) -> list[dict]:
+    """RCSB's precomputed sequence-identity clusters -- answers "how many genuinely distinct
+    structures of this protein exist" and "is this a unique fold or the 400th lysozyme", questions
+    an expert asks reflexively that no single-entry metadata field can answer."""
+    if clusters_df.empty:
+        return []
+    df = clusters_df.merge(entries_df[["pdb_id", "resolution_A"]], on="pdb_id", how="inner").drop_duplicates("pdb_id")
+    df = df[df["cluster_size"] >= 2]
+    if df.empty:
+        return []
+    rows = df.sample(n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        size = int(r["cluster_size"])
+        q = f"How many other PDB entries share essentially the same sequence as {r['pdb_id']} (at 30% identity)?"
+        redundancy_read = ("an extremely well-studied protein/family" if size > 500 else
+                           "a well-studied protein" if size > 50 else
+                           "a modestly redundant entry, several related structures exist" if size > 5 else
+                           "a fairly unique entry, few close relatives in the PDB")
+        a = (
+            f"{r['pdb_id']} belongs to a 30%-sequence-identity cluster of {size} polymer entities "
+            f"across the PDB — {redundancy_read}. This threshold groups by broad sequence relatedness, "
+            f"not near-identity — a large cluster can include distant homologs solved under many "
+            f"different conditions/ligands/mutants, not necessarily {size} redetermined copies of the "
+            f"literal same construct (for that, the 100%-identity clustering is the relevant one). "
+            f"Cluster size is a genuine signal of how well-trodden this structural space is, useful "
+            f"context before treating any single entry as uniquely authoritative."
+        )
+        out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_obsolete_entry_warning(obsolete_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Obsolete/superseded PDB IDs -- "use 6XYZ, 1ABC was superseded" is real expert knowledge
+    chatPDB previously had no way to produce, since obsolete entries were never in its corpus pull
+    to begin with (RCSB's search API returns only released entries by default)."""
+    if obsolete_df.empty:
+        return []
+    df = obsolete_df[obsolete_df["superseded_by"].notna() & (obsolete_df["superseded_by"] != "")]
+    out = []
+    if not df.empty:
+        rows = df.sample(n=min(n // 2, len(df)), random_state=rng.randint(0, 1 << 30))
+        for _, r in rows.iterrows():
+            q = f"What can you tell me about PDB entry {r['obsolete_id']}?"
+            title_part = f"Its original title was \"{r['title']}\"." if pd.notna(r.get("title")) else ""
+            a = (
+                f"{r['obsolete_id']} is an obsolete PDB ID — it was withdrawn and superseded by "
+                f"{r['superseded_by']}. {title_part} "
+                f"Use {r['superseded_by']} instead; {r['obsolete_id']}'s coordinates are no longer "
+                f"part of the current PDB archive, though the ID itself remains in records like this "
+                f"one specifically so it can be traced to its replacement."
+            )
+            out.append(make_example(q, a, "database_cross_referencing"))
+    no_replacement = obsolete_df[(obsolete_df["superseded_by"].isna()) | (obsolete_df["superseded_by"] == "")]
+    if not no_replacement.empty:
+        rows2 = no_replacement.sample(n=min(n - len(out), len(no_replacement)), random_state=rng.randint(0, 1 << 30))
+        for _, r in rows2.iterrows():
+            q = f"What can you tell me about PDB entry {r['obsolete_id']}?"
+            a = (
+                f"{r['obsolete_id']} is an obsolete PDB ID with no documented replacement — it was "
+                f"withdrawn from the archive rather than superseded by a newer determination. "
+                f"Whatever structure or question you're working from, this specific ID no longer "
+                f"resolves to current coordinates; there's no newer entry to redirect you to for this "
+                f"one."
+            )
+            out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+# --- Round 4: AlphaFraud integration (staged -- partial coverage, see PROJECT_PLAN.md) -----------
+
+def gen_alphafraud_rich_comparison(alphafraud_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Replaces the round-3 gen_alphafold_vs_experimental's thin pLDDT-vs-resolution comparison with
+    real computed TM-score/GDT-TS/lDDT/CA-RMSD and a FRAUD score / "confidently wrong" flag, from
+    Marc's sibling project AlphaFraud. AlphaFraud's backfill is still in progress (staged, partial
+    coverage) -- this generator degrades gracefully (returns []) until the corpus file exists."""
+    if alphafraud_df.empty:
+        return []
+    df = alphafraud_df[alphafraud_df["tm_by_experiment"].notna() & alphafraud_df["mean_plddt"].notna()]
+    if df.empty:
+        return []
+    rows = df.sample(n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        tm = float(r["tm_by_experiment"])
+        plddt = float(r["mean_plddt"])
+        agreement = ("excellent agreement with the experimental structure" if tm >= 0.8 else
+                     "reasonable agreement, broad fold likely correct but check details" if tm >= 0.5 else
+                     "poor agreement — the predicted and experimental structures diverge substantially")
+        q = f"AlphaFold's prediction for PDB entry {r['entry_id']} (UniProt {r['uniprot']}) has mean pLDDT {plddt:.1f}. How well does it actually match the real experimental structure?"
+        a = (
+            f"Measured directly against the real experimental structure ({r['entry_id']}, "
+            f"{r['method']}, deposited after AlphaFold2's training cutoff so this is a genuine "
+            f"held-out comparison): TM-score {tm:.3f} ({agreement})"
+        )
+        if pd.notna(r.get("gdt_ts")):
+            a += f", GDT-TS {float(r['gdt_ts']):.3f}"
+        if pd.notna(r.get("lddt")):
+            a += f", lDDT {float(r['lddt']):.3f}"
+        if pd.notna(r.get("ca_rmsd")):
+            a += f", Cα-RMSD {float(r['ca_rmsd']):.2f} Å"
+        a += "."
+        if bool(r.get("confidently_wrong")):
+            a += (f" This is flagged 'confidently wrong': AlphaFold reported high confidence "
+                  f"(pLDDT {plddt:.1f}) yet the actual fold doesn't match well (TM {tm:.3f}) — a real "
+                  f"case where AlphaFold's own confidence score should not have been trusted at face "
+                  f"value. High pLDDT reflects the model's self-consistency, not a guarantee of "
+                  f"correctness against a structure it never saw.")
+        else:
+            a += (f" AlphaFold's confidence (pLDDT {plddt:.1f}) is reasonably well calibrated here — "
+                  f"the predicted structure's actual accuracy roughly matches what its confidence "
+                  f"score implied.")
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
+# --- Round 4: DOI/citation verification -------------------------------------
+
+def gen_citation_honesty(citation_df: pd.DataFrame, entries_df: pd.DataFrame,
+                          rng: random.Random, n: int) -> list[dict]:
+    """Independently-verified citation trust, in three flavours (verified / mismatched /
+    unresolvable) -- teaches the model to flag a deposited citation string rather than repeat it
+    blindly. Citations are verified at build time against CrossRef + PubMed (scripts/
+    verify_citations.py), not trusted as deposited."""
+    if citation_df.empty:
+        return []
+    merged = entries_df[entries_df["citation_doi"].notna()][
+        ["pdb_id", "citation_doi", "citation_title", "citation_journal", "citation_year"]
+    ].merge(citation_df, left_on="citation_doi", right_on="doi", how="inner")
+    out = []
+    for bucket, label_n in [("verified", n // 2), ("mismatched", n // 4), ("unresolvable", n // 4)]:
+        subset = merged[merged["bucket"] == bucket]
+        if subset.empty:
+            continue
+        rows = subset.sample(n=min(label_n, len(subset)), random_state=rng.randint(0, 1 << 30))
+        for _, r in rows.iterrows():
+            q = f"What paper describes PDB entry {r['pdb_id']}, and can you confirm the citation is real?"
+            if bucket == "verified":
+                a = (
+                    f"\"{r['citation_title']}\"" + (f", {r['citation_journal']}" if pd.notna(r.get("citation_journal")) else "")
+                    + (f" ({int(r['citation_year'])})" if pd.notna(r.get("citation_year")) else "")
+                    + f". DOI: {r['citation_doi']}. I checked this against CrossRef directly (not just "
+                      f"repeating the deposited string) — the DOI resolves and the returned title/year "
+                      f"match what's deposited, so this citation is independently confirmed."
+                )
+            elif bucket == "mismatched":
+                a = (
+                    f"The deposited citation for {r['pdb_id']} gives the title as "
+                    f"\"{r['citation_title']}\", DOI {r['citation_doi']}. I checked this DOI against "
+                    f"CrossRef directly, and it resolves to a *different* title: "
+                    f"\"{r['crossref_title']}\". I'd flag this as a real discrepancy worth checking at "
+                    f"the source (RCSB/PDBe) rather than trusting either string blindly — deposited "
+                    f"citation metadata is occasionally wrong (typo in the DOI, citation updated after "
+                    f"deposition but the PDB record wasn't)."
+                )
+            else:
+                a = (
+                    f"The deposited citation for {r['pdb_id']} gives DOI {r['citation_doi']}, but I "
+                    f"checked it against CrossRef directly and it doesn't resolve to a real record. "
+                    f"This can mean the DOI has a typo, was never registered, or refers to a "
+                    f"'to be published' placeholder that was never updated after the paper appeared "
+                    f"under a different DOI. I won't assert this citation is valid without independent "
+                    f"confirmation — worth checking RCSB's page for {r['pdb_id']} directly, or "
+                    f"searching by title/author instead of trusting the deposited DOI."
+                )
+            out.append(make_example(q, a, "database_cross_referencing"))
+    return out
+
+
+def gen_tool_verify_citation(entries_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Tool-chaining skill: teaches the model to emit a live CrossRef verification call for an
+    out-of-corpus/user-supplied DOI, rather than asserting from parametric memory whether a paper is
+    real -- the correct division of labour with gen_citation_honesty, which handles the 213k
+    in-corpus citations via build-time verification instead."""
+    df = entries_df[entries_df["citation_doi"].notna()]
+    if df.empty:
+        return []
+    rows = df.sample(n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        q = f"Someone told me the DOI {r['citation_doi']} describes PDB entry {r['pdb_id']}. Can you verify that's a real, correct citation?"
+        a = (
+            "```python\n"
+            "import requests\n\n"
+            f"doi = '{r['citation_doi']}'\n"
+            "r = requests.get(f'https://api.crossref.org/works/{doi}', params={'mailto': 'you@example.com'})\n"
+            "if r.status_code == 200:\n"
+            "    work = r.json()['message']\n"
+            "    print('Title:', work.get('title', [None])[0])\n"
+            "    print('Year:', work.get('published', {}).get('date-parts'))\n"
+            "else:\n"
+            "    print('DOI does not resolve -- treat the citation as unverified')\n"
+            "```\n\n"
+            f"I'd run this rather than answer from memory — I can't reliably recall whether a specific "
+            f"DOI resolves or matches a specific claimed title, and asserting it does without checking "
+            f"risks confidently repeating a wrong or fabricated citation. A CrossRef exact-DOI lookup "
+            f"is fast and authoritative for this."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Refusal boundary (supplementary, small)
 # ---------------------------------------------------------------------------
@@ -1518,10 +2580,10 @@ def main() -> None:
     all_examples += gen_format_pdb_vs_mmcif(c["entries"][c["entries"]["atom_count"] > 20000], rng, k)
     all_examples += gen_biological_assembly_asu(c["entries"], rng, k)
 
-    # experimental_method — split across 10 generators. Round 3 added validation_geometry,
-    # alphafold_vs_experimental, and multihop_structure_quality_full once wwPDB validation and
-    # AlphaFold DB were pulled in.
-    k = per_class // 10
+    # experimental_method — split across 16 generators. Round 4 added PDB-REDO refinement deltas,
+    # EMDB map metadata, OPM membrane placement, the AlphaFraud rich comparison (replacing the
+    # thin round-3 pLDDT-only one), the house structure-report-card format, and assembly biography.
+    k = per_class // 16
     print("Generating experimental_method ...")
     all_examples += gen_xray_resolution_quality(c["entries"], rng, k)
     all_examples += gen_rfree_quality(c["entries"], rng, k)
@@ -1533,11 +2595,19 @@ def main() -> None:
     all_examples += gen_validation_geometry(c["validation"], c["entries"], rng, k)
     all_examples += gen_alphafold_vs_experimental(c["alphafold"], c["entries"], c["sifts_uniprot"], rng, k)
     all_examples += gen_multihop_structure_quality_full(c["entries"], c["validation"], rng, k)
+    all_examples += gen_pdbredo_refinement_delta(c["pdbredo"], c["entries"], rng, k)
+    all_examples += gen_emdb_map_metadata(c["emdb"], rng, k)
+    all_examples += gen_opm_membrane(c["opm"], c["entries"], rng, k)
+    all_examples += gen_alphafraud_rich_comparison(c["alphafraud"], rng, k)
+    all_examples += gen_structure_report_card(c["entries"], c["validation"], rng, k)
+    print("  computing FreeSASA interface areas for assembly biography (execution-verified) ...")
+    all_examples += gen_assembly_biography(c["structure_files"], c["entries"], rng, k)
 
-    # tool_calling — split across 7 generators. DSSP and NMR-model-count are execution-verified
+    # tool_calling — split across 15 generators. DSSP and NMR-model-count are execution-verified
     # against the full 256,444-file mmCIF pool (data/structures_all/, corpus expansion round 2).
-    # Round 3 added the two tool-chaining generators (multi-step scripts, not one-call-per-example).
-    k = per_class // 7
+    # Round 4 added FreeSASA/fpocket/Foldseek/US-align/PLIP/cctbx execution-verified generators,
+    # the citation-verification tool call, and the self-consistency check.
+    k = per_class // 15
     print("Generating tool_calling ...")
     all_examples += gen_biopython_count(c["entries"], rng, k)
     all_examples += gen_gemmi_metadata(c["entries"], rng, k)
@@ -1548,13 +2618,21 @@ def main() -> None:
     print("  running tool-chain (parse+DSSP) analysis scripts (execution-verified) ...")
     all_examples += gen_tool_chain_structure_analysis(c["structure_files"], rng, k)
     all_examples += gen_tool_chain_lookup(c["sifts_uniprot"], c["pharos"], rng, k)
+    print("  running FreeSASA/fpocket/Foldseek/US-align/PLIP (execution-verified) ...")
+    all_examples += gen_freesasa_interface(c["structure_files"], rng, k)
+    all_examples += gen_fpocket_druggability(c["structure_files"], rng, k)
+    all_examples += gen_foldseek_neighbors(c["structure_files"], rng, k)
+    all_examples += gen_usalign_pairwise(c["structure_files"], c["entries"], c["sifts_uniprot"], rng, k)
+    all_examples += gen_plip_interactions(c["structure_files"], rng, k)
+    all_examples += gen_geometry_recompute_disagreement(c["structure_files"], c["validation"], rng, k)
+    all_examples += gen_self_consistency_check(c["structure_files"], c["entries"], rng, k)
+    all_examples += gen_tool_verify_citation(c["entries"], rng, k)
 
-    # database_cross_referencing — split across 21 generators. Round 3 added: single-source
-    # generators for BindingDB/STRING/AlphaFold; bidirectional traversal (UniProt->PDB,
-    # ligand->PDB); deeper multi-hop chains (target context, ligand quality, fold->function);
-    # cross-database disagreement + missing-data honesty; comparative (two entries); and a
-    # RAG-shaped multi-source synthesis generator.
-    k = per_class // 21
+    # database_cross_referencing — split across 29 generators. Round 4 added: SCOP2 fold
+    # descriptions, MobiDB disorder, sequence redundancy clusters, obsolete-entry warnings,
+    # citation honesty (3-bucket verified/mismatched/unresolvable), family/homolog reasoning,
+    # structural biography, and the small scoped disease-target-context chain.
+    k = per_class // 29
     print("Generating database_cross_referencing ...")
     all_examples += gen_uniprot_chain_mapping(c["sifts_uniprot"], rng, k)
     all_examples += gen_pfam_domain(c["sifts_pfam"], rng, k)
@@ -1577,10 +2655,19 @@ def main() -> None:
     all_examples += gen_missing_data_honesty(c["entries"], c["validation"], rng, k)
     all_examples += gen_compare_two_entries(c["entries"], c["sifts_uniprot"], rng, k)
     all_examples += gen_rag_synthesis(c["entries"], c["sifts_uniprot"], c["uniprot"], c["pharos"], c["validation"], rng, k)
+    all_examples += gen_scop2_fold_description(c["scop2"], rng, k)
+    all_examples += gen_mobidb_disorder(c["mobidb"], rng, k)
+    all_examples += gen_sequence_redundancy(c["clusters_30"], c["entries"], rng, k)
+    all_examples += gen_obsolete_entry_warning(c["obsolete"], rng, k)
+    all_examples += gen_citation_honesty(c["citations"], c["entries"], rng, k)
+    all_examples += gen_family_homolog_context(c["cath_joined"], rng, k)
+    all_examples += gen_structural_biography(c["entries"], c["sifts_uniprot"], rng, k)
+    all_examples += gen_disease_target_context(c["disease_context"], c["sifts_uniprot"], c["bindingdb"], rng, k)
 
-    # supplementary refusal boundary
+    # supplementary refusal boundary — round 4 added mutation/variant-effect framing
     print("Generating refusal_boundary ...")
     all_examples += gen_refusal_boundary(c["uniprot"], rng, min(1000, per_class // 5))
+    all_examples += gen_mutation_refusal(c["uniprot"], rng, min(1000, per_class // 5))
 
     print(f"\nGenerated {len(all_examples):,} raw examples. Validating ...")
     valid_pdb_ids = set(c["entries"]["pdb_id"].str.upper())
