@@ -9,16 +9,20 @@ reasons about structures that already exist, their provenance, and how to query 
 with real tools.
 
 **Author:** Marc C. Deller, D.Phil. ([marcdeller.com](https://marcdeller.com))
-**Status:** Phase 3 (SFT dataset) complete, round 4 (2026-07-17): seven new corpus sources
-(PDB-REDO, EMDB, SCOP2, MobiDB, OPM, sequence-redundancy clusters, obsolete-entry mapping), a
-staged AlphaFraud integration, an independent CrossRef/PubMed citation-verification pipeline, five
-new local tool-exec integrations (FreeSASA, fpocket, Foldseek, US-align, PLIP), and ~34 new
-generators covering house report-card formatting, family/homolog reasoning, structural/assembly
-biography, self-consistency checks, mutation-refusal, and a small disease-target-context chain.
-Base model: `mlx-community/Qwen3-32B-4bit`. RAG corpus: 37 files / 102,163 chunks (up from
-22 / 79,235). SFT dataset v4: 93,725 examples (74,981 train / 9,372 valid / 9,372 test),
-2.7% rejection rate, full regeneration ran ~8.5h (dominated by the new execution-verified
-tool-calling generators' long subprocess tail — see `data/README.md`'s v4 entry).
+**Status:** Phase 3 (SFT dataset) complete through round 5 (2026-07-18): a full visualization/
+rendering/simulation tool review — full PyMOL (436 commands) and ChimeraX (547 commands) command
+awareness via live introspection, sequence alignment (pairwise + MAFFT MSA), WebLogo sequence
+logos, biotite structural plots (DSSP track, Ramachandran, contact map, B-factor), py3Dmol
+interactive viewers, pdb-tools, a 2D topology schematic, electrostatics prep, molecular dynamics
+(OpenMM + GROMACS), crystallography (CCP4 + PHENIX, real refinement/validation against real
+deposited reflection data), and AutoDock Vina docking — 21 new execution-verified generators.
+Full narrative in §7, after the round 4 entry.
+Base model: `mlx-community/Qwen3-32B-4bit`. RAG corpus: 39 files / 102,873 chunks (up from
+37 / 102,163 — the two new command corpora, pymol_commands.csv 436 chunks + chimerax_commands.csv
+274 chunks). SFT dataset v5: 94,376 examples
+(75,502 train / 9,437 valid / 9,437 test), 2.8% rejection rate, full regeneration ran ~15h across
+two attempts (a real full-scale-only bug crashed attempt 1 three hours in; fixed, then a clean
+~11h completion — see §7's round 5 bug list and `data/README.md`'s v5 entry).
 Phase 4 (QLoRA fine-tune) not yet started.
 **Fine-tune stack:** MLX-LM on Apple Silicon (committed — same choice chem_sage validated over five
 rounds; see section 3).
@@ -367,6 +371,36 @@ chem_sage's shim ran RDKit (and PyMOL for rendering). chatPDB's equivalent, stru
 - **MDAnalysis** / **ProDy** — ensemble/trajectory analysis; useful for NMR ensembles and
   descriptive (not predictive) flexibility questions.
 - **BioPandas** — tabular PDB/mmCIF wrangling for bulk questions.
+
+**Round 5 additions** (full tool-ecosystem review, Marc's explicit ask — see round 5 narrative
+below for the full story):
+- **PyMOL — full command awareness**: `scripts/build_pymol_command_corpus.py` introspects the real
+  installed PyMOL 3.1.0 API (`dir(cmd)` + `inspect.getdoc`/`inspect.signature`) for its complete
+  436-command surface, replacing the previous 3-hardcoded-template approach.
+- **ChimeraX** — headless-scriptable (`ChimeraX --nogui --silent --exit --script`), full command
+  awareness via `scripts/build_chimerax_command_corpus.py` introspecting
+  `chimerax.core.commands.cli.registered_commands()`/`cli.usage()` (547 real commands).
+- **MAFFT** (brew) + `Bio.Align.PairwiseAligner` — real pairwise and multiple sequence alignment.
+- **logomaker** / **weblogo** — real WebLogo-style sequence logos, downstream of a real MAFFT MSA.
+- **biotite** — native mmCIF phi/psi (Ramachandran), Cα-Cα contact maps, per-residue B-factor
+  extraction, all computed directly from the deposited structure, no PDB conversion needed.
+- **py3Dmol** — self-contained interactive HTML structure viewers (complements PyMOL/ChimeraX's
+  static ray-traced PNGs).
+- **pdb-tools** — ~50 small, real PDB-manipulation CLI utilities (`pdb_selchain`, `pdb_delhetatm`,
+  `pdb_tidy`, etc.).
+- **pdb2pqr** + ChimeraX's `coulombic` command — real electrostatics preprocessing (protonation
+  states, partial charges/radii) and calculation, without taking on APBS.
+- **OpenMM** (pip) + **GROMACS** (brew, `gmx`) — real energy-minimization pipelines (Python-native
+  and CLI-file-based respectively), scoped to minimization rather than production MD trajectories
+  for corpus-generation runtime reasons.
+- **CCP4** (`/Applications/ccp4-9`) + **PHENIX** (`/Applications/phenix-2.1-6048`) — both real,
+  pre-installed local suites (not pip packages, each needs its own env script sourced). Real
+  `cif2mtz`/`ctruncate`/`refmac5` (CCP4) and `phenix.refine`/`phenix.molprobity` (PHENIX)
+  refinement/validation against real deposited reflection data. PHENIX's bundled cctbx build also
+  revives round 4's abandoned standalone-cctbx/MolProbity item.
+- **AutoDock Vina** (pip, non-trivial Boost-version install — see `requirements.txt`) + OpenBabel
+  (already installed) for receptor/ligand PDBQT prep — real redocking of deposited ligands back
+  into their own binding pockets.
 
 ---
 
@@ -844,6 +878,136 @@ round. Flagged the realistic timeline mid-run and confirmed with Marc to let it 
 completion rather than truncate. `corpus_lookup.py`'s registry and the RAG corpus (now includes all
 round 4 source files) were updated. Full narrative, class balance, and token stats in
 `data/README.md`'s v4 entry.
+
+**Round 5 (2026-07-17): a full visualization/rendering/simulation tool review, Marc's explicit
+ask.** Named requirements: full PDB text/graphical generate-parse-manipulate-view capability via
+PyMOL and ChimeraX with "full awareness of *ALL* pymol commands"; sequence alignments; DSSP plots;
+WebLogo plots; 2D topology plots; an open brainstorm for anything else an expert structural
+biologist would expect. Mid-planning, extended twice further: molecular dynamics (OpenMM,
+GROMACS) and in-depth crystallography (CCP4, PHENIX, MTZ files). Every item below was live-verified
+against the real installed tool before being written into a generator — several initial
+assumptions turned out wrong and were caught this way, not shipped:
+
+- **Full PyMOL command awareness**: `scripts/build_pymol_command_corpus.py` introspects the real
+  installed PyMOL 3.1.0 API (`dir(cmd)` + `inspect.getdoc`/`inspect.signature`) — 436 real commands,
+  346 with real docstrings. Replaces the previous 3-hardcoded-template `gen_pymol_script` with ~19
+  execution-verified task templates (each actually run headless via `pymol -cq` against a real
+  structure before being kept) plus `gen_pymol_command_reference`, a broad docstring-grounded Q&A
+  generator covering the full 436-command surface.
+- **Full ChimeraX command awareness**: `scripts/build_chimerax_command_corpus.py` spawns ChimeraX
+  headless (`--nogui --silent --exit --script`) and has it introspect its own command registry
+  (`chimerax.core.commands.cli.registered_commands()`/`cli.usage()`) — 547 real commands. Mirrors
+  the PyMOL treatment: `gen_chimerax_script` (execution-verified `.cxc` scripts) +
+  `gen_chimerax_command_reference` (broad command Q&A).
+- **Sequence alignment**: `gen_pairwise_alignment` (real `Bio.Align.PairwiseAligner`, same
+  SIFTS-pairing pattern as round 4's `gen_usalign_pairwise`) and `gen_msa_family` (real MAFFT MSA
+  over RCSB's own 30%-identity sequence clusters, round 4's `clusters_30pct.csv`).
+- **WebLogo sequence logos**: `gen_sequence_logo`, chained off the same real MAFFT MSA, rendered
+  with `logomaker` — real position-frequency-matrix logo images, the technique
+  weblogo.threeplusone.com's own tool is built on.
+- **biotite structural plots**: `gen_dssp_plot` (visual SSE track from the already-verified DSSP
+  wrapper), `gen_ramachandran_plot` and `gen_contact_map` and `gen_bfactor_plot` (all computed
+  directly from native mmCIF via biotite — no legacy-PDB conversion needed for these three).
+- **py3Dmol** (`gen_py3dmol_view`, self-contained interactive HTML viewers) and **pdb-tools**
+  (`gen_pdbtools_manipulation`, real `pdb_selchain`/`pdb_delhetatm`/`pdb_delresname`/`pdb_tidy`/
+  `pdb_selres` invocations).
+- **2D topology diagrams — reduced scope, documented honestly.** FlatProt, the one real current
+  tool, requires Python <3.14; chatPDB's venv runs 3.14.6 (confirmed via `pip install flatprot
+  --dry-run`) — genuinely blocked, not worked around. `gen_topology_schematic` builds a real linear
+  SSE schematic (helices as boxes, strands as arrows, real sequence order) from the same DSSP
+  assignment, explicitly smaller in scope than a full spatial 2D fold diagram with strand-crossing
+  connectivity — the example text says so, rather than overclaiming.
+- **Electrostatics**: `gen_pdb2pqr_prep` (real PDB2PQR protonation/charge/radius assignment);
+  ChimeraX's `coulombic` command is covered "for free" by the ChimeraX command corpus above. APBS
+  skipped (heavier binary, uncertain 2026 maintenance status).
+- **Molecular dynamics**: `gen_openmm_script` (real OpenMM energy minimization, implicit solvent,
+  AMBER14 — real potential energy before/after) and `gen_gromacs_pipeline` (real
+  `pdb2gmx→editconf→solvate→grompp→mdrun` pipeline, explicit SPC/E water, real final potential
+  energy). Both scoped to minimization, not production MD trajectories, for corpus-generation
+  runtime reasons — both execution-verified, both protein-only (a real bug caught here: the
+  structure-size filter initially didn't exclude nucleic-acid entries, and amber99sb-ildn has no
+  DNA/RNA residue templates — `pdb2gmx` genuinely rejected mixed-type chains).
+- **Crystallography — CCP4 + PHENIX, both real and already installed.** Corrected mid-planning:
+  Marc initially believed CCP4 was installed and PHENIX wasn't; live verification found the
+  opposite was closer to true, then a direct filesystem search (Spotlight's query missed it) found
+  **both** genuinely installed and working — `/Applications/ccp4-9` (`refmac5` 5.8.0431 confirmed)
+  and `/Applications/phenix-2.1-6048` (`phenix.refine` 2.1-6048 confirmed). Real deposited
+  structure-factor files fetched from RCSB (`-sf.cif.gz`), converted to MTZ via CCP4's `cif2mtz`,
+  with `ctruncate` run first for the ~half of deposits that are intensities (I/SIGI) rather than
+  amplitudes (F/SIGF) — column names/types vary genuinely per entry and are detected live, never
+  assumed. Four generators: `gen_mtz_manipulation` (real gemmi.Mtz summaries), `gen_ccp4_refmac_
+  script` (real refmac5 refinement, real R-factor/R-free before/after), `gen_phenix_refine_script`
+  (real phenix.refine), and `gen_phenix_molprobity` (real MolProbity validation via PHENIX's
+  bundled cctbx — **revives round 4's abandoned standalone-cctbx/MolProbity item**, no git clone
+  needed). Documented limitation: deposited SF data is merged/scaled, not raw diffraction images,
+  so `aimless`/`pointless` (unmerged-data scaling) genuinely can't be exercised from this data
+  source — out of scope, not silently skipped.
+- **AutoDock Vina docking**: `gen_autodock_vina_docking`, real redocking of a structure's own
+  deposited ligand back into its own deposited pocket (small search box centred on the real
+  ligand position, low exhaustiveness — a redocking sanity check, not a blind search), real
+  binding-affinity scores from Vina's scoring function.
+- **Boltz2 — investigated and dropped.** A stray Spotlight hit turned out to be test fixtures from
+  the unrelated BoltzMaker project, confirmed by Marc. Also out of scope on principle: Boltz2 is a
+  structure *predictor*, and chatPDB's explicit design boundary is reasoning about *existing*
+  structures, never predicting new ones.
+
+**Real bugs found and fixed this round**, all caught by the same "actually run it" discipline
+every generator in this file follows:
+1. **GROMACS writes its run summary to stderr, not stdout.** `gen_gromacs_pipeline`'s first version
+   parsed `mdrun`'s stdout for the "Potential Energy" line and silently produced zero examples —
+   confirmed by direct comparison against a manual terminal run, where the exact same text appeared
+   on stderr instead.
+2. **Relative cache paths broke once the subprocess `cwd` changed.** `_prepare_mtz`'s cached
+   `pdb_path`/`mtz_path` were relative to the project root; every crystallography generator spawns
+   its subprocess with `cwd` set to a fresh temp directory, so the same relative path silently
+   resolved to a nonexistent location and every refmac5/phenix.refine call failed with zero
+   examples produced. Fixed by resolving to absolute paths at the cache-read/write boundary.
+2b. **The four crystallography generators each independently rebuilt their own candidate pool**,
+   rather than sharing one — caught mid-smoke-test via `sample`-based profiling (the same
+   diagnostic tool round 4's hang-investigation playbook established) showing genuine, ongoing
+   HTTPS I/O to RCSB long after a pool should have been warm. Refactored to build the pool once in
+   `main()` and pass it to all three MTZ-based generators.
+3. **`vina`'s pip build failed against the default Homebrew Boost (1.90)** — a real C++
+   `std::type_traits` incompatibility between Boost 1.90's headers and vina 1.2.7's code, not a
+   local misconfiguration. Fixed with `boost@1.85` (keg-only), `-mt`-suffixed libs symlinked to
+   unsuffixed names, and `CONDA_DEFAULT_ENV`/`CONDA_PREFIX` spoofed to point vina's setup.py (which
+   only searches a conda env, `/usr/local/include`, or `/usr/include` — never Homebrew's
+   `/opt/homebrew`) at the right Boost. Documented in full in `requirements.txt` since a fresh venv
+   rebuild would hit the identical wall.
+4. **meeko's receptor preparation hit a reproducible internal error** (`RuntimeError: Updated N H
+   positions but deleted M`) on multiple real deposited structures in this environment — not an
+   altloc or hydrogen issue (both ruled out live). Substituted OpenBabel's AutoDock plugin
+   (`obabel -xr`) for receptor PDBQT prep, which required its own fix: Vina's PDBQT parser only
+   accepts a strict record-type whitelist (`ROOT`/`ATOM`/`BRANCH`/`TORSDOF`/etc.) and rejects real
+   PDB header lines OpenBabel carries through from the input file — filtered before handing off to
+   Vina.
+5. **A real large-assembly structure with a >1-character chain name crashed the entire full-scale
+   run three hours in.** `gemmi.write_pdb()` correctly raises `RuntimeError: chain name too long
+   for the PDB format: AAA` (the legacy PDB format only supports single-character chain IDs;
+   modern mmCIF doesn't have that limit, and large assemblies genuinely need >26 chains) —
+   `gen_pdbtools_manipulation`'s except clause only caught subprocess errors, not this, so the
+   exception propagated all the way to `main()` and killed the process. Every hour of work already
+   done was lost, since `train.jsonl`/`valid.jsonl`/`test.jsonl` are only written once, at the very
+   end. Audited every other `_gemmi_to_pdb`/`write_pdb` call site in the file for the same gap
+   (found one more, `gen_pdb2pqr_prep`) and fixed both, then added a structural backstop: `_safe_gen()`
+   now wraps all ~65 generator call sites in `main()`, catching and logging any exception a
+   generator doesn't already handle internally rather than letting one bad structure end the whole
+   multi-hour build. A real, costly gap the round-4 architecture never surfaced at that smaller
+   tool/generator count — worth remembering for any future round that adds more execution-verified
+   generators touching real, messy deposited structures.
+
+**Result: 94,376 examples** (75,502 train / 9,437 valid / 9,437 test), 2.8% rejection rate — 94% of
+the 100,000 target, in line with v3/v4's landing pattern. Class balance:
+file_format_literacy 25,000 (exact), database_cross_referencing 23,269, tool_calling 22,338,
+experimental_method 21,875, refusal_boundary 2,000 (exact) — no class badly skewed. Zero
+`_safe_gen` backstop triggers on the successful run (the two real bugs above were both fixed before
+this run started, not papered over by the backstop catching them silently). Full run took ~15h
+across two attempts (the fatal crash above ~3h into attempt 1, then a clean ~11h completion on
+attempt 2 after the fix) — longer than round 4's ~8.5h as expected, the new molecular-dynamics/
+crystallography/docking generators' PHENIX/GROMACS/ChimeraX/PyMOL per-call process-startup
+overhead now dominating more than fpocket's long tail alone did in round 4. `corpus_lookup.py`'s
+registry and the RAG corpus were updated with the two new command-corpus files. Full narrative,
+class balance, and token stats in `data/README.md`'s v5 entry.
 
 ### Phase 4 — QLoRA fine-tune with MLX-LM (0.5–1 day of compute)
 `config/train_config.yaml` seeded from chem_sage's validated field names and values (rank, RSLoRA,

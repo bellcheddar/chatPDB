@@ -8,6 +8,7 @@ data/sft/*.jsonl
 data/structures/
 data/structures_all/
 data/structures_pool_ids.csv
+data/cache/
 adapters/
 fused_model/
 models/

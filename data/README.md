@@ -7,16 +7,19 @@ MLX-LM expects a data directory containing `train.jsonl` and `valid.jsonl` (note
 data/
 ├── corpus/            # RAG sources: RCSB/SIFTS/CATH/InterPro/Pharos/TWILIGHT/UniProt/AlphaFold/
 │                        # BindingDB/wwPDB-validation/STRING/PDB-REDO/EMDB/SCOP2/MobiDB/OPM/
-│                        # clusters/obsolete/AlphaFraud/citations/disease_context (gitignored,
-│                        # Phase 2 + corpus expansion + round 3 + round 4 sources, 2026-07-17)
+│                        # clusters/obsolete/AlphaFraud/citations/disease_context/pymol/chimerax
+│                        # (gitignored, Phase 2 + corpus expansion + round 3/4/5 sources)
+├── cache/crystallography/ # round 5: cached real MTZ conversions (RCSB structure-factor pulls,
+│                        # cif2mtz/ctruncate output) keyed by PDB ID, built once and reused across
+│                        # gen_mtz_manipulation/gen_ccp4_refmac_script/gen_phenix_refine_script
 ├── structures/         # 820-file PDB-format sample, superseded by structures_all/ below but kept
 │                        # (small, fast for smoke-testing) — gitignored, scripts/download_structure_pool.py
 ├── structures_all/      # ALL 256,444 entries as native mmCIF, 353 GB (gitignored, "let's add ALL PDB
 │                         # files" round, 2026-07-16) — scripts/download_all_structures.py
-└── sft/               # SFT data (MLX --data directory), v4 populated 2026-07-17
-    ├── train.jsonl     # 74,981 examples
-    ├── valid.jsonl     # 9,372 examples
-    └── test.jsonl      # 9,372 examples, frozen, eval only
+└── sft/               # SFT data (MLX --data directory), v5 populated 2026-07-18
+    ├── train.jsonl     # 75,502 examples
+    ├── valid.jsonl     # 9,437 examples
+    └── test.jsonl      # 9,437 examples, frozen, eval only
 ```
 
 ## SFT format
@@ -76,7 +79,8 @@ prompt shortened here for readability, full text is in `config/system_prompt.txt
 | v1 | R1 | 45,502 (36,402 train) | 2.2% | `build_dataset.py --n 50000 --seed 51` | Target was 50,000; `tool_calling`'s two execution-verified generators (DSSP, NMR model count) were hard-capped by an 820-file structure pool, not padded. Superseded by v2. |
 | v2 | R2 | 50,233 (40,187 train) | 1.5% | `build_dataset.py --n 50000 --seed 51` (after "let's add ALL PDB files and ALL fields" — full mmCIF pool + expanded RCSB metadata) | Full 50,000 target hit; `tool_calling` reaches its complete 12,500 target for the first time (previously capped at 8,010) now that the structure pool is 256,444 files instead of 820. Added 4 new generators (citation, unit cell/space group, crystallization conditions, organism/taxonomy) from the expanded metadata pull. Superseded by v3. |
 | v3 | R3 | 97,241 (77,793 train) | 1.2% | `build_dataset.py --n 100000 --seed 51` (after "get AlphaFolddb, PDBbind/BindingDB, wwPDB validation reports, and STRING... make it all thorough") | 4 new corpus sources + ~19 new generators across multi-hop chains, bidirectional traversal, cross-database disagreement, missing-data honesty, comparative examples, tool-chaining, and RAG-shaped synthesis. Target doubled to 100,000 to match the larger generator roster; landed at 97,241 (97% of target) with the lowest rejection rate yet. Superseded by v4. |
-| v4 | R4 | 93,725 (74,981 train) | 2.7% | `build_dataset.py --n 100000 --seed 51` (after a Fable 5 brainstorm on remaining expert-depth gaps, implemented in full) | 7 new corpus sources + AlphaFraud (staged) + independent CrossRef/PubMed citation verification + 5 new local tool-exec integrations (FreeSASA/fpocket/Foldseek/US-align/PLIP) + ~34 new generators. Landed at 93,725 (94% of target); rejection rate ticked up from v3's 1.2% since several round-4 generators haven't had multiple tuning passes yet. Full run took ~8.5h, dominated by the new execution-verified tool-calling generators' long subprocess tail (fpocket especially). |
+| v4 | R4 | 93,725 (74,981 train) | 2.7% | `build_dataset.py --n 100000 --seed 51` (after a Fable 5 brainstorm on remaining expert-depth gaps, implemented in full) | 7 new corpus sources + AlphaFraud (staged) + independent CrossRef/PubMed citation verification + 5 new local tool-exec integrations (FreeSASA/fpocket/Foldseek/US-align/PLIP) + ~34 new generators. Landed at 93,725 (94% of target); rejection rate ticked up from v3's 1.2% since several round-4 generators haven't had multiple tuning passes yet. Full run took ~8.5h, dominated by the new execution-verified tool-calling generators' long subprocess tail (fpocket especially). Superseded by v5. |
+| v5 | R5 | 94,376 (75,502 train) | 2.8% | `build_dataset.py --n 100000 --seed 51` (a full visualization/rendering/simulation tool review — full PyMOL/ChimeraX command awareness, sequence alignment, WebLogo, biotite plots, py3Dmol, pdb-tools, a 2D topology schematic, MD (OpenMM/GROMACS), crystallography (CCP4/PHENIX), AutoDock Vina docking) | 21 new execution-verified generators (see `PROJECT_PLAN.md`'s round 5 section for the full per-generator writeup). Landed at 94,376 (94% of target). Two real bugs caught only at full scale, both fixed before the numbers above: (1) a legitimate large-assembly structure with a >1-character chain name crashed `gemmi.write_pdb()` with a `RuntimeError` three hours into the first full run — `gen_pdbtools_manipulation`'s except clause only caught subprocess errors, not this, and lost all accumulated work since output is only written once at the end; (2) added `_safe_gen()`, a backstop wrapper around every one of the ~65 generator call sites in `main()`, so no single generator's unexpected exception can crash the whole multi-hour build again — a real robustness gap the round-4 architecture never needed to close at this scale/tool-count before. Full run took ~15h (22:26 run 1's fatal crash + investigation + fix + ~11h clean re-run), the new molecular-dynamics/crystallography/docking generators' PHENIX/GROMACS/ChimeraX/PyMOL process-startup overhead now dominating more than fpocket alone did in v4. |
 
 v4 class balance: `file_format_literacy` 25,000, `database_cross_referencing` 23,201,
 `experimental_method` 21,875, `tool_calling` 21,653, `refusal_boundary` 2,000 (supplementary, not

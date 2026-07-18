@@ -30,6 +30,36 @@ plip                         # real protein-ligand interaction fingerprints (rou
 # for install method (Foldseek: GitHub release binary; US-align/fpocket: brew tap brewsci/bio;
 # cctbx: attempted, abandoned after repeated network failures, optional).
 
+# --- Round 5: PyMOL/ChimeraX full command awareness, sequence alignment, structural plots, ---
+# --- molecular dynamics, crystallography, docking ---
+logomaker                    # WebLogo-style sequence logo rendering
+weblogo                      # secondary sequence-logo engine, matches weblogo.threeplusone.com's own tool
+biotite                      # native mmCIF phi/psi, contact maps, B-factor extraction
+py3Dmol                      # self-contained interactive HTML structure viewer
+pdb-tools                    # ~50 small real PDB-manipulation CLI utilities (pdb_selchain etc.)
+pdb2pqr                      # protonation state / charge / radius assignment (electrostatics prep)
+openmm                       # Python-native MD: energy minimization, real prebuilt pip wheels
+mdtraj                       # MD trajectory analysis, complements MDAnalysis above
+meeko                        # AutoDock ligand/receptor prep (successor to MGLTools)
+rdkit                        # meeko dependency
+# vina: pip install requires Boost, and stock Homebrew boost (1.90) fails to compile against
+# vina 1.2.7's C++ code (missing std:: type_traits includes -- a real boost-1.90/vina
+# incompatibility, not a local misconfiguration). Fix: `brew install boost@1.85`, symlink its
+# `-mt`-suffixed libs to unsuffixed names (`ln -s libboost_thread-mt.dylib libboost_thread.dylib`
+# etc. in /opt/homebrew/opt/boost@1.85/lib/), then:
+#   CONDA_DEFAULT_ENV=fake CONDA_PREFIX=/opt/homebrew/opt/boost@1.85 pip install vina
+# (vina's setup.py only searches a conda env, /usr/local/include, or /usr/include for Boost --
+# spoofing CONDA_PREFIX is the only way to point it at Homebrew's non-standard /opt/homebrew path
+# without sudo-writing into /usr/local, which is root-owned on Apple Silicon.)
+vina
+# mafft / gromacs: brew, not pip (`brew install mafft gromacs`) -- both real, bottled formulas.
+# CCP4 (/Applications/ccp4-9) and PHENIX (/Applications/phenix-2.1-6048): pre-installed local
+# suites, not pip packages. Both require sourcing their own env script before use:
+#   source /Applications/ccp4-9/bin/ccp4.setup-sh
+#   source /Applications/phenix-2.1-6048/phenix_env.sh
+# PHENIX bundles its own working cctbx build (phenix.molprobity), so the standalone-cctbx
+# git-clone attempted and abandoned in round 4 is no longer needed for MolProbity validation.
+
 # --- Chat CLI ---
 rich                        # console rendering (Markdown, panels, progress, themes)
 prompt_toolkit              # interactive input with history, arrow keys, bottom toolbar

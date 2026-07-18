@@ -145,6 +145,15 @@ REGISTRY: list[CorpusFile] = [
     CorpusFile("citation_verification.csv", "doi",
                ["bucket", "crossref_title", "title_similarity", "pmid_doi_match"],
                subdir="citations", case_insensitive=False),
+    # Round 5: full PyMOL/ChimeraX command corpora (introspected from the real installed tools,
+    # scripts/build_pymol_command_corpus.py / build_chimerax_command_corpus.py). Case-sensitive --
+    # PyMOL/ChimeraX command names are lowercase by convention and exact-match matters here.
+    CorpusFile("pymol_commands.csv", "command",
+               ["signature", "docstring", "gui_only"],
+               subdir="pymol", case_insensitive=False),
+    CorpusFile("chimerax_commands.csv", "command",
+               ["usage"],
+               subdir="chimerax", case_insensitive=False),
 ]
 
 _cache: dict[str, pd.DataFrame] = {}

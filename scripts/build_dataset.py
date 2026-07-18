@@ -98,6 +98,11 @@ def load_corpus() -> dict:
     c["citations"] = _read_optional(CORPUS / "citations/citation_verification.csv")
     c["disease_context"] = _read_optional(CORPUS / "disease_context/disease_target_context.csv")
 
+    # Round 5 sources: full PyMOL/ChimeraX command corpora (introspected from the real installed
+    # tools, scripts/build_pymol_command_corpus.py / build_chimerax_command_corpus.py).
+    c["pymol_commands"] = _read_optional(CORPUS / "pymol/pymol_commands.csv")
+    c["chimerax_commands"] = _read_optional(CORPUS / "chimerax/chimerax_commands.csv")
+
     # CATH domain -> classification join, keyed by PDB id + chain (mirrors rag/corpus_lookup.py's
     # two-hop join, precomputed here once for speed across thousands of generated examples).
     # sifts_pdb_cath.csv columns: PDB, CHAIN, SP_PRIMARY, CATH_ID (confirmed live 2026-07-15).
@@ -624,27 +629,285 @@ def gen_gemmi_metadata(df: pd.DataFrame, rng: random.Random, n: int) -> list[dic
     return out
 
 
-def gen_pymol_script(df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
-    rows = df[df["pdb_id"].notna()].sample(n=min(n, len(df)), random_state=rng.randint(0, 1 << 30))
-    tasks = [
-        ("render a cartoon view coloured by chain", lambda pid: (
-            f"```python\nfrom pymol import cmd\ncmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
-            f"cmd.hide('everything')\ncmd.show('cartoon')\ncmd.util.cbc()\ncmd.bg_color('white')\n"
-            f"cmd.png('{pid.lower()}_cartoon.png', width=800, height=800, dpi=150, ray=1)\n```")),
-        ("colour the structure by B-factor", lambda pid: (
-            f"```python\nfrom pymol import cmd\ncmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
-            f"cmd.hide('everything')\ncmd.show('cartoon')\ncmd.spectrum('b', 'blue_white_red')\n```")),
-        ("select and count all heteroatoms that aren't water", lambda pid: (
-            f"```python\nfrom pymol import cmd\ncmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
-            f"cmd.select('ligands', 'hetatm and not resn HOH')\n"
-            f"print('Ligand atom count:', cmd.count_atoms('ligands'))\n```")),
+# Round 5: real command tasks, each built from a command name confirmed present in the live
+# PyMOL 3.1.0 command corpus (data/corpus/pymol/pymol_commands.csv, scripts/build_pymol_command_
+# corpus.py). Every task is execution-verified below (headless `pymol -cq`) before being kept --
+# tasks whose preconditions don't hold for a given structure (e.g. cealign needing >=2 chains,
+# symexp needing crystal symmetry) are silently dropped for that structure rather than faked.
+PYMOL_TASKS: list[tuple[str, "callable"]] = [
+    ("render a cartoon view coloured by chain", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.hide('everything')\ncmd.show('cartoon')\ncmd.util.cbc()\ncmd.bg_color('white')\n"
+        f"cmd.png('{pid.lower()}_cartoon.png', width=800, height=800, dpi=150, ray=1)")),
+    ("colour the structure by B-factor", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.hide('everything')\ncmd.show('cartoon')\ncmd.spectrum('b', 'blue_white_red')")),
+    ("select and count all heteroatoms that aren't water", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.select('ligands', 'hetatm and not resn HOH')\n"
+        f"print('Ligand atom count:', cmd.count_atoms('ligands'))")),
+    ("show the structure as a surface coloured by chain", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.hide('everything')\ncmd.show('surface')\ncmd.util.cbc()")),
+    ("display all cysteine residues as sticks, coloured yellow", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.hide('everything')\ncmd.show('cartoon')\ncmd.select('cys', 'resn CYS')\n"
+        f"cmd.show('sticks', 'cys')\ncmd.color('yellow', 'cys')")),
+    ("assign secondary structure and colour helices red, sheets yellow, loops green", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.dss()\ncmd.color('red', 'ss H')\ncmd.color('yellow', 'ss S')\ncmd.color('green', 'ss L+\'\'')")),
+    ("remove all water molecules and report the remaining atom count", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.remove('solvent')\nprint('Atoms remaining:', cmd.count_atoms('all'))")),
+    ("remove hydrogens and report the remaining atom count", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.remove('hydro')\nprint('Atoms remaining:', cmd.count_atoms('all'))")),
+    ("label every alpha carbon with its residue name and number", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.label('name CA', '\"%s%s\" % (resn, resi)')")),
+    ("compute the structure's bounding-box extent", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"extent = cmd.get_extent('all')\nprint('Extent:', extent)")),
+    ("compute the centre of mass of the structure", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"com = cmd.centerofmass('all')\nprint('Centre of mass:', com)")),
+    ("compute the total molecular surface area", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.set('dot_solvent', 1)\narea = cmd.get_area('all')\nprint('Surface area (A^2):', area)")),
+    ("save only the first chain to its own PDB file", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"first_chain = cmd.get_chains('all')[0]\n"
+        f"cmd.save('{pid.lower()}_chainA.pdb', f'chain {{first_chain}}')")),
+    ("show only polymer atoms, hiding everything else", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.hide('everything')\ncmd.show('cartoon', 'polymer')")),
+    ("count how many distinct chains the structure has", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"print('Chains:', cmd.get_chains('all'))")),
+    ("generate crystallographic symmetry mates within 5 A and count the resulting objects", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.symexp('sym', '{pid.lower()}', '{pid.lower()}', 5.0)\n"
+        f"print('Symmetry-mate objects:', len(cmd.get_names()) - 1)")),
+    ("superpose the structure's first two chains onto each other with cealign", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"chains = cmd.get_chains('all')\n"
+        f"cmd.create('mobile', f'chain {{chains[1]}}')\ncmd.create('target', f'chain {{chains[0]}}')\n"
+        f"result = cmd.cealign('target', 'mobile')\nprint('CE-align RMSD:', result['RMSD'])")),
+    ("split an NMR ensemble into separate objects, one per model", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.split_states('{pid.lower()}')\nprint('State objects:', len(cmd.get_names()) - 1)")),
+    ("save the current session as a .pse file", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.hide('everything')\ncmd.show('cartoon')\ncmd.save('{pid.lower()}.pse')")),
+    ("convert the structure to a MOL2 file", lambda pid: (
+        f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+        f"cmd.save('{pid.lower()}.mol2')")),
+]
+
+
+def _pymol_execute(code_body: str, pdb_path: Path) -> bool:
+    """Actually run PyMOL headless (`pymol -cq`) against a real structure file and return True iff
+    it exits cleanly -- the execution-verification step every tool_calling generator in this file
+    uses, extended here to PyMOL scripts specifically (previously templated but never run)."""
+    pymol_bin = shutil.which("pymol")
+    if not pymol_bin:
+        return False
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_pdb = Path(tmpdir) / pdb_path.name
+        local_pdb.write_bytes(pdb_path.read_bytes())
+        script_path = Path(tmpdir) / "script.py"
+        script_path.write_text("from pymol import cmd\n" + code_body + "\n")
+        try:
+            result = subprocess.run(
+                [pymol_bin, "-cq", str(script_path)],
+                capture_output=True, text=True, timeout=45, cwd=tmpdir,
+            )
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0 and "Traceback" not in result.stderr
+
+
+def gen_pymol_script(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified against real structure files (converted mmCIF -> legacy PDB, same
+    conversion DSSP/FreeSASA/PLIP already rely on) -- every kept example was actually run headless
+    through PyMOL 3.1.0 and exited cleanly, not just templated."""
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        pid = path.stem.upper()
+        task_desc, code_fn = rng.choice(PYMOL_TASKS)
+        code_body = code_fn(pid)
+        pdb_tmp = None
+        try:
+            pdb_tmp = Path(_gemmi_to_pdb(path))
+            local_pdb = pdb_tmp.with_name(f"{pid.lower()}.pdb")
+            local_pdb.write_bytes(pdb_tmp.read_bytes())
+            ok = _pymol_execute(code_body, local_pdb)
+            local_pdb.unlink(missing_ok=True)
+        except Exception:
+            ok = False
+        finally:
+            if pdb_tmp:
+                Path(pdb_tmp).unlink(missing_ok=True)
+        if not ok:
+            continue
+        q = f"Write a PyMOL script to load PDB entry {pid} and {task_desc}."
+        a = (
+            "```python\nfrom pymol import cmd\n" + code_body + "\n```\n\n"
+            f"This was run headless (`pymol -cq`) against the real deposited coordinates for {pid} "
+            f"and executed without error, confirming the script is valid against this structure."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_pymol_command_reference(pymol_commands_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Broad PyMOL command awareness: real command names + real docstrings introspected directly
+    from the installed `pymol.cmd` API (dir(cmd) + inspect.getdoc), not execution-verified per
+    example (docstrings alone don't imply a runnable invocation without structure-specific args),
+    but every command name and description is ground truth, not invented -- this is what gives the
+    model awareness of PyMOL's *complete* command surface (436 real commands), not just the ~19
+    tasks gen_pymol_script above execution-verifies."""
+    rows = pymol_commands_df[
+        pymol_commands_df["docstring"].notna() & (pymol_commands_df["docstring"].str.len() > 10)
     ]
+    rows = rows.sample(n=min(n, len(rows)), random_state=rng.randint(0, 1 << 30))
     out = []
     for _, r in rows.iterrows():
-        pid = r["pdb_id"]
-        task_desc, code_fn = rng.choice(tasks)
-        q = f"Write a PyMOL script to load PDB entry {pid} and {task_desc}."
-        a = code_fn(pid) + f"\n\nThis loads the real coordinates for {pid} and performs the requested operation directly in PyMOL's Python API."
+        cmd_name = r["command"]
+        doc = r["docstring"]
+        sig = r["signature"] or "()"
+        gui_note = (
+            " Note: this is a GUI-oriented command (mouse/window/wizard state) rather than one "
+            "meaningfully scriptable in a headless batch run."
+            if r["gui_only"] else ""
+        )
+        q = f"What does PyMOL's `{cmd_name}` command do, and what's its signature?"
+        a = (
+            f"`cmd.{cmd_name}{sig}`\n\n{doc}{gui_note}\n\n"
+            f"(Introspected directly from the installed PyMOL 3.1.0 `cmd` API via `inspect.getdoc` "
+            f"-- this is PyMOL's own real documentation for the command, not a paraphrase.)"
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# ChimeraX (round 5): real command tasks, each built from a command name confirmed present in the
+# live ChimeraX 1.10.1 command corpus (data/corpus/chimerax/chimerax_commands.csv,
+# scripts/build_chimerax_command_corpus.py). Execution-verified headless below.
+# ---------------------------------------------------------------------------
+
+CHIMERAX_BIN = Path("/Applications/ChimeraX-1.10.1.app/Contents/MacOS/ChimeraX")
+
+CHIMERAX_TASKS: list[tuple[str, "callable"]] = [
+    ("open the structure, show it as cartoon coloured by chain, and save a PNG image", lambda pid: (
+        f"open {pid.lower()}.pdb\nhide atoms\nshow cartoon\ncolor bychain\n"
+        f"save {pid.lower()}_cartoon.png width 800 height 800")),
+    ("colour the structure by B-factor", lambda pid: (
+        f"open {pid.lower()}.pdb\nhide atoms\nshow cartoon\ncolor byattribute bfactor")),
+    ("show the structure as a molecular surface coloured by chain", lambda pid: (
+        f"open {pid.lower()}.pdb\nhide atoms\nsurface\ncolor bychain")),
+    ("compute a Coulombic electrostatic surface colouring", lambda pid: (
+        f"open {pid.lower()}.pdb\nsurface\ncoulombic")),
+    ("delete all solvent (water) atoms", lambda pid: (
+        f"open {pid.lower()}.pdb\ndelete solvent")),
+    ("select non-solvent heteroatoms (ligands)", lambda pid: (
+        f"open {pid.lower()}.pdb\nselect ligand")),
+    ("save the current session as a .cxs file", lambda pid: (
+        f"open {pid.lower()}.pdb\nhide atoms\nshow cartoon\nsave {pid.lower()}.cxs")),
+    ("split the model into separate objects, one per chain", lambda pid: (
+        f"open {pid.lower()}.pdb\nsplit")),
+    ("show only chain A as cartoon, hiding everything else", lambda pid: (
+        f"open {pid.lower()}.pdb\nhide atoms\nshow /A cartoon")),
+    ("report information about the opened model", lambda pid: (
+        f"open {pid.lower()}.pdb\ninfo models")),
+    ("orient the camera so the whole structure is visible", lambda pid: (
+        f"open {pid.lower()}.pdb\nhide atoms\nshow cartoon\nview")),
+    ("rename the opened model to a custom label", lambda pid: (
+        f"open {pid.lower()}.pdb\nrename #1 name {pid.lower()}_model")),
+]
+
+
+def _chimerax_execute(cxc_body: str, pdb_path: Path) -> bool:
+    """Actually run ChimeraX headless (--nogui --silent --exit --script) against a real structure
+    file and return True iff it exits cleanly."""
+    if not CHIMERAX_BIN.exists():
+        return False
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_pdb = Path(tmpdir) / pdb_path.name
+        local_pdb.write_bytes(pdb_path.read_bytes())
+        script_path = Path(tmpdir) / "script.cxc"
+        script_path.write_text(cxc_body + "\n")
+        try:
+            result = subprocess.run(
+                [str(CHIMERAX_BIN), "--nogui", "--silent", "--exit", "--script", str(script_path)],
+                capture_output=True, text=True, timeout=60, cwd=tmpdir,
+            )
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+            return False
+        stderr_lower = result.stderr.lower()
+        return result.returncode == 0 and "error" not in stderr_lower and "traceback" not in stderr_lower
+
+
+def gen_chimerax_script(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified against real structure files -- every kept example was actually run
+    headless through ChimeraX 1.10.1's own command language and exited cleanly."""
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        pid = path.stem.upper()
+        task_desc, code_fn = rng.choice(CHIMERAX_TASKS)
+        cxc_body = code_fn(pid)
+        pdb_tmp = None
+        try:
+            pdb_tmp = Path(_gemmi_to_pdb(path))
+            local_pdb = pdb_tmp.with_name(f"{pid.lower()}.pdb")
+            local_pdb.write_bytes(pdb_tmp.read_bytes())
+            ok = _chimerax_execute(cxc_body, local_pdb)
+            local_pdb.unlink(missing_ok=True)
+        except Exception:
+            ok = False
+        finally:
+            if pdb_tmp:
+                Path(pdb_tmp).unlink(missing_ok=True)
+        if not ok:
+            continue
+        q = f"Write a ChimeraX command script to open PDB entry {pid} and {task_desc}."
+        a = (
+            "```\n" + cxc_body + "\n```\n\n"
+            f"This is ChimeraX's native command language (a `.cxc` script), run headless "
+            f"(`ChimeraX --nogui --silent --exit --script`) against the real deposited coordinates "
+            f"for {pid} and confirmed to execute without error."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_chimerax_command_reference(chimerax_commands_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Broad ChimeraX command awareness: real command names + real usage strings introspected
+    directly from the installed ChimeraX 1.10.1 command registry (chimerax.core.commands.cli),
+    covering the full 547-command surface -- ground truth, same discipline as
+    gen_pymol_command_reference above."""
+    rows = chimerax_commands_df[
+        chimerax_commands_df["usage"].notna() & (chimerax_commands_df["usage"].str.len() > 10)
+    ]
+    rows = rows.sample(n=min(n, len(rows)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        cmd_name = r["command"]
+        usage = r["usage"]
+        q = f"What does the ChimeraX `{cmd_name}` command do, and how is it used?"
+        a = (
+            f"```\n{usage}\n```\n\n"
+            f"(Introspected directly from the installed ChimeraX 1.10.1 command registry via "
+            f"`chimerax.core.commands.cli.usage` -- this is ChimeraX's own real usage text for the "
+            f"command, not a paraphrase.)"
+        )
         out.append(make_example(q, a, "tool_calling"))
     return out
 
@@ -1178,6 +1441,1312 @@ def gen_geometry_recompute_disagreement(structure_files: list[Path], validation_
             f"in exact residue count from wwPDB's percentile pipeline depending on version/tolerance "
             f"settings, so minor differences here are expected and not a red flag by themselves; a "
             f"large disagreement would be worth investigating further."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Round 5: sequence alignment (pairwise + MSA), WebLogo, biotite plots, py3Dmol, pdb-tools,
+# topology schematic, electrostatics prep, molecular dynamics, crystallography, docking.
+# ---------------------------------------------------------------------------
+
+def gen_pairwise_alignment(entries_df: pd.DataFrame, sifts_uniprot_df: pd.DataFrame,
+                            rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified (computed live, not templated): real Bio.Align.PairwiseAligner global
+    alignment between two real deposited sequences of the same UniProt protein, found via the same
+    SIFTS-mapping pattern gen_usalign_pairwise uses for structures -- here at the sequence level."""
+    from Bio import Align
+
+    sifts = sifts_uniprot_df.copy()
+    sifts["pdb_id"] = sifts["PDB"].str.upper()
+    counts = sifts.groupby("SP_PRIMARY")["pdb_id"].nunique()
+    multi = counts[counts >= 2]
+    if multi.empty:
+        return []
+    seq_by_id = entries_df.set_index("pdb_id")["primary_sequence"].to_dict()
+    aligner = Align.PairwiseAligner()
+    aligner.mode = "global"
+    aligner.open_gap_score = -10
+    aligner.extend_gap_score = -0.5
+    aligner.substitution_matrix = Align.substitution_matrices.load("BLOSUM62")
+
+    accs = rng.sample(list(multi.index), k=min(n * 3, len(multi)))
+    out = []
+    for acc in accs:
+        if len(out) >= n:
+            break
+        ids = sifts[sifts["SP_PRIMARY"] == acc]["pdb_id"].unique()
+        ids = [i for i in ids if i in seq_by_id and pd.notna(seq_by_id[i]) and len(str(seq_by_id[i])) > 10]
+        if len(ids) < 2:
+            continue
+        id_a, id_b = rng.sample(list(ids), 2)
+        seq_a, seq_b = str(seq_by_id[id_a]), str(seq_by_id[id_b])
+        try:
+            alignment = aligner.align(seq_a, seq_b)[0]
+            score = alignment.score
+            aligned_a, aligned_b = str(alignment[0]), str(alignment[1])
+            matches = sum(1 for x, y in zip(aligned_a, aligned_b) if x == y and x != "-")
+            identity = 100.0 * matches / max(len(aligned_a), 1)
+        except Exception:
+            continue
+        q = f"Write Biopython code to pairwise-align the sequences of PDB entries {id_a} and {id_b} (both UniProt {acc}) and report their percent identity."
+        a = (
+            "```python\n"
+            "from Bio import Align\n\n"
+            "aligner = Align.PairwiseAligner()\n"
+            "aligner.mode = 'global'\n"
+            "aligner.open_gap_score = -10\n"
+            "aligner.extend_gap_score = -0.5\n"
+            "aligner.substitution_matrix = Align.substitution_matrices.load('BLOSUM62')\n"
+            f"alignment = aligner.align(seq_{id_a.lower()}, seq_{id_b.lower()})[0]\n"
+            "print(f'Score: {alignment.score}')\n"
+            "print(alignment)\n"
+            "```\n\n"
+            f"Aligning the real deposited sequences for {id_a} ({len(seq_a)} aa) and {id_b} "
+            f"({len(seq_b)} aa), both UniProt {acc}: alignment score {score:.1f}, {identity:.1f}% "
+            f"sequence identity over the aligned length. Both entries model the same protein, so a "
+            f"high identity is expected -- real differences typically trace to different construct "
+            f"boundaries, tags, or missing/disordered regions in one of the two deposited models."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_msa_family(entries_df: pd.DataFrame, clusters_df: pd.DataFrame,
+                    rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real MAFFT multiple sequence alignment over a small real set of
+    same-cluster sequences (data/corpus/clusters/clusters_30pct.csv, RCSB's own 30%-identity
+    sequence clustering, round 4)."""
+    mafft_bin = shutil.which("mafft")
+    if not mafft_bin:
+        return []
+    seq_by_id = entries_df.set_index("pdb_id")["primary_sequence"].to_dict()
+    sizes = clusters_df.groupby("cluster_id")["pdb_id"].nunique()
+    candidate_clusters = sizes[(sizes >= 3) & (sizes <= 8)].index.tolist()
+    if not candidate_clusters:
+        return []
+    rng.shuffle(candidate_clusters)
+    out = []
+    for cid in candidate_clusters:
+        if len(out) >= n:
+            break
+        members = clusters_df[clusters_df["cluster_id"] == cid]["pdb_id"].unique().tolist()
+        seqs = [(pid, str(seq_by_id[pid])) for pid in members
+                if pid in seq_by_id and pd.notna(seq_by_id[pid]) and len(str(seq_by_id[pid])) > 10]
+        if len(seqs) < 3:
+            continue
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                fasta_path = Path(tmpdir) / "family.fasta"
+                with open(fasta_path, "w") as f:
+                    for pid, seq in seqs:
+                        f.write(f">{pid}\n{seq}\n")
+                result = subprocess.run(
+                    [mafft_bin, "--quiet", str(fasta_path)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    continue
+                aligned_len = len(result.stdout.split(">")[1].split("\n", 1)[1].replace("\n", ""))
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, IndexError):
+            continue
+        pid_list = ", ".join(pid for pid, _ in seqs)
+        q = f"Run a multiple sequence alignment with MAFFT over the sequences of PDB entries {pid_list} (all in the same 30%-identity cluster) and report the alignment length."
+        a = (
+            "```python\n"
+            "import subprocess\n\n"
+            "subprocess.run(['mafft', '--quiet', 'family.fasta'], capture_output=True, text=True)\n"
+            "# family.fasta contains one real deposited sequence per entry, FASTA-formatted\n"
+            "```\n\n"
+            f"MAFFT-aligning the {len(seqs)} real deposited sequences ({pid_list}) gives an alignment "
+            f"length of {aligned_len} columns. These entries were grouped by RCSB's own 30%-sequence-"
+            f"identity clustering, so real conservation patterns in this alignment reflect genuine "
+            f"shared ancestry/function, not coincidence -- gaps mark real indels between the family "
+            f"members' deposited constructs."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_sequence_logo(entries_df: pd.DataFrame, clusters_df: pd.DataFrame,
+                       rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: chained off the same real MAFFT MSA gen_msa_family uses, then a real
+    WebLogo-style sequence-logo image built via logomaker (https://weblogo.threeplusone.com is the
+    classic web tool this reproduces the underlying position-frequency-matrix technique of) --
+    verified by confirming the rendered PNG actually exists and is non-empty, not just that the code
+    didn't raise."""
+    mafft_bin = shutil.which("mafft")
+    if not mafft_bin:
+        return []
+    import logomaker
+    import matplotlib
+    matplotlib.use("Agg")
+
+    seq_by_id = entries_df.set_index("pdb_id")["primary_sequence"].to_dict()
+    sizes = clusters_df.groupby("cluster_id")["pdb_id"].nunique()
+    candidate_clusters = sizes[(sizes >= 4) & (sizes <= 10)].index.tolist()
+    if not candidate_clusters:
+        return []
+    rng.shuffle(candidate_clusters)
+    out = []
+    for cid in candidate_clusters:
+        if len(out) >= n:
+            break
+        members = clusters_df[clusters_df["cluster_id"] == cid]["pdb_id"].unique().tolist()
+        seqs_raw = [(pid, str(seq_by_id[pid])) for pid in members
+                    if pid in seq_by_id and pd.notna(seq_by_id[pid]) and len(str(seq_by_id[pid])) > 10]
+        if len(seqs_raw) < 4:
+            continue
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                fasta_path = Path(tmpdir) / "family.fasta"
+                with open(fasta_path, "w") as f:
+                    for pid, seq in seqs_raw:
+                        f.write(f">{pid}\n{seq}\n")
+                result = subprocess.run(
+                    [mafft_bin, "--quiet", str(fasta_path)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode != 0 or not result.stdout.strip():
+                    continue
+                aligned_seqs = []
+                for block in result.stdout.split(">")[1:]:
+                    seq_lines = block.split("\n", 1)[1].replace("\n", "")
+                    aligned_seqs.append(seq_lines.upper())
+                if len({len(s) for s in aligned_seqs}) != 1:
+                    continue  # MAFFT should always emit equal-length rows; skip defensively if not
+                matrix = logomaker.alignment_to_matrix(aligned_seqs)
+                logo = logomaker.Logo(matrix, figsize=(max(6, len(matrix) * 0.15), 2.5))
+                png_path = Path(tmpdir) / "logo.png"
+                logo.fig.savefig(png_path, dpi=100)
+                if not png_path.exists() or png_path.stat().st_size < 500:
+                    continue
+                alignment_len = len(aligned_seqs[0])
+        except Exception:
+            continue
+        pid_list = ", ".join(pid for pid, _ in seqs_raw)
+        q = f"Build a sequence logo (WebLogo-style) from the aligned sequences of PDB entries {pid_list} (same 30%-identity cluster) and tell me how wide the resulting alignment is."
+        a = (
+            "```python\n"
+            "import subprocess, logomaker\n\n"
+            "subprocess.run(['mafft', '--quiet', 'family.fasta'], capture_output=True, text=True)\n"
+            "# parse the aligned FASTA output into a list of equal-length sequence strings, then:\n"
+            "matrix = logomaker.alignment_to_matrix(aligned_seqs)\n"
+            "logo = logomaker.Logo(matrix)\n"
+            "logo.fig.savefig('logo.png')\n"
+            "```\n\n"
+            f"Aligning the {len(seqs_raw)} real deposited sequences ({pid_list}) with MAFFT gives an "
+            f"alignment {alignment_len} columns wide; logomaker renders this into a real sequence "
+            f"logo (a position-frequency-matrix stack plot, the same technique classic WebLogo "
+            f"(weblogo.threeplusone.com) popularized) — tall, single-letter columns mark strongly "
+            f"conserved positions across this protein family, while short/mixed columns mark "
+            f"variable positions."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def _run_dssp_ordered(path: Path) -> list[str] | None:
+    """Like _run_dssp_mmcif but returns per-residue SS codes in sequence order (a list), not
+    aggregate counts -- needed for a visual SSE track plot rather than a summary statistic."""
+    from Bio.PDB import MMCIFParser
+    from Bio.PDB.DSSP import DSSP
+    try:
+        structure = MMCIFParser(QUIET=True).get_structure(path.stem, str(path))
+        model = structure[0]
+        dssp = DSSP(model, str(path), dssp="mkdssp", file_type="mmCIF")
+        return [dssp[key][2] for key in dssp.keys()] or None
+    except Exception:
+        return None
+
+
+def gen_dssp_plot(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: a real visual DSSP secondary-structure track, built from the same
+    already-verified DSSP wrapper _run_dssp_mmcif uses (just ordered per-residue instead of
+    aggregated), rendered with matplotlib and confirmed to actually write a non-empty PNG."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        ss_list = _run_dssp_ordered(path)
+        if not ss_list or len(ss_list) < 10:
+            continue
+        color_map = {"H": "red", "G": "salmon", "I": "darkred", "E": "gold", "B": "khaki"}
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                png_path = Path(tmpdir) / "dssp_track.png"
+                fig, ax = plt.subplots(figsize=(max(6, len(ss_list) * 0.05), 1.2))
+                for i, ss in enumerate(ss_list):
+                    ax.axvspan(i, i + 1, color=color_map.get(ss, "lightgray"))
+                ax.set_xlim(0, len(ss_list))
+                ax.set_yticks([])
+                ax.set_xlabel("Residue index")
+                fig.tight_layout()
+                fig.savefig(png_path, dpi=100)
+                plt.close(fig)
+                if not png_path.exists() or png_path.stat().st_size < 500:
+                    continue
+        except Exception:
+            continue
+        pid = path.stem.upper()
+        helix = sum(1 for s in ss_list if s in "HGI")
+        strand = sum(1 for s in ss_list if s in "EB")
+        q = f"Render a visual DSSP secondary-structure track plot for PDB entry {pid} (mmCIF file `{path.name}`)."
+        a = (
+            "```python\n"
+            "from Bio.PDB import MMCIFParser\n"
+            "from Bio.PDB.DSSP import DSSP\n"
+            "import matplotlib.pyplot as plt\n\n"
+            f"structure = MMCIFParser(QUIET=True).get_structure('{pid}', '{path.name}')\n"
+            f"dssp = DSSP(structure[0], '{path.name}', dssp='mkdssp', file_type='mmCIF')\n"
+            "ss_track = [dssp[k][2] for k in dssp.keys()]\n"
+            "# colour each residue position by its DSSP code (H/G/I=helix, E/B=strand, else loop)\n"
+            "# and plot as a horizontal coloured track along the sequence\n"
+            "```\n\n"
+            f"Running DSSP on the real deposited coordinates for {pid} and plotting the {len(ss_list)}-"
+            f"residue secondary-structure track: {helix} helix residues, {strand} strand residues. "
+            f"The rendered PNG shows this as a coloured horizontal bar (red=helix, gold=strand, "
+            f"gray=loop/coil) — the same per-residue DSSP assignment as the summary statistic "
+            f"version, just visualised positionally instead of aggregated."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_ramachandran_plot(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real phi/psi backbone dihedral angles computed directly from native
+    mmCIF via biotite (biotite.structure.dihedral_backbone), plotted as a real Ramachandran
+    scatter -- a visual complement to the Ramachandran *outlier percentage* already in the corpus
+    from wwPDB validation data (gen_validation_geometry)."""
+    import biotite.structure.io.pdbx as pdbx
+    import biotite.structure as struc
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        try:
+            cif = pdbx.CIFFile.read(str(path))
+            arr = pdbx.get_structure(cif, model=1)
+            arr = arr[struc.filter_amino_acids(arr)]
+            if len(arr) < 20:
+                continue
+            phi, psi, _ = struc.dihedral_backbone(arr)
+            phi_deg = np.degrees(phi[~np.isnan(phi) & ~np.isnan(psi)])
+            psi_deg = np.degrees(psi[~np.isnan(phi) & ~np.isnan(psi)])
+            if len(phi_deg) < 10:
+                continue
+            with tempfile.TemporaryDirectory() as tmpdir:
+                png_path = Path(tmpdir) / "rama.png"
+                fig, ax = plt.subplots(figsize=(5, 5))
+                ax.scatter(phi_deg, psi_deg, s=4, alpha=0.6)
+                ax.set_xlim(-180, 180)
+                ax.set_ylim(-180, 180)
+                ax.set_xlabel("Phi (deg)")
+                ax.set_ylabel("Psi (deg)")
+                ax.axhline(0, color="gray", lw=0.5)
+                ax.axvline(0, color="gray", lw=0.5)
+                fig.tight_layout()
+                fig.savefig(png_path, dpi=100)
+                plt.close(fig)
+                if not png_path.exists() or png_path.stat().st_size < 500:
+                    continue
+            # rough favoured-region heuristic for the readout text, not a MolProbity-grade call
+            favoured = int(np.sum(
+                ((phi_deg < 0) & (psi_deg > -90) & (psi_deg < 180) & (psi_deg > 40)) |
+                ((phi_deg < 0) & (phi_deg > -160) & (psi_deg < 40) & (psi_deg > -90))
+            ))
+        except Exception:
+            continue
+        pid = path.stem.upper()
+        q = f"Compute backbone phi/psi dihedral angles for PDB entry {pid} (mmCIF file `{path.name}`) and render a Ramachandran plot."
+        a = (
+            "```python\n"
+            "import biotite.structure.io.pdbx as pdbx\n"
+            "import biotite.structure as struc\n"
+            "import matplotlib.pyplot as plt\n\n"
+            f"cif = pdbx.CIFFile.read('{path.name}')\n"
+            "arr = pdbx.get_structure(cif, model=1)\n"
+            "arr = arr[struc.filter_amino_acids(arr)]\n"
+            "phi, psi, omega = struc.dihedral_backbone(arr)\n"
+            "plt.scatter(np.degrees(phi), np.degrees(psi), s=4)\n"
+            "```\n\n"
+            f"Computed {len(phi_deg)} real (phi, psi) residue pairs directly from {pid}'s deposited "
+            f"coordinates (no PDB conversion needed — biotite reads mmCIF natively); roughly "
+            f"{favoured}/{len(phi_deg)} fall in the classic alpha-helix/beta-sheet favoured regions "
+            f"by a simple geometric heuristic. This is the same underlying geometry MolProbity's "
+            f"Ramachandran outlier percentage (already in this corpus) is derived from, just plotted "
+            f"point-by-point instead of summarised as a single outlier percentage."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_contact_map(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real CA-CA distance matrix computed directly from native mmCIF via
+    biotite, rendered as a contact-map heatmap."""
+    import biotite.structure.io.pdbx as pdbx
+    import biotite.structure as struc
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        try:
+            cif = pdbx.CIFFile.read(str(path))
+            arr = pdbx.get_structure(cif, model=1)
+            ca = arr[(arr.atom_name == "CA") & struc.filter_amino_acids(arr)]
+            if len(ca) < 20 or len(ca) > 1500:  # keep the O(n^2) matrix + render cost bounded
+                continue
+            coords = ca.coord
+            dist = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
+            contacts = int(np.sum(dist < 8.0)) - len(ca)  # exclude the diagonal (self-contacts)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                png_path = Path(tmpdir) / "contact_map.png"
+                fig, ax = plt.subplots(figsize=(5, 5))
+                im = ax.imshow(dist < 8.0, cmap="Greys", origin="lower")
+                ax.set_xlabel("Residue index")
+                ax.set_ylabel("Residue index")
+                fig.tight_layout()
+                fig.savefig(png_path, dpi=100)
+                plt.close(fig)
+                if not png_path.exists() or png_path.stat().st_size < 500:
+                    continue
+        except Exception:
+            continue
+        pid = path.stem.upper()
+        q = f"Compute a Cα-Cα contact map for PDB entry {pid} (mmCIF file `{path.name}`), using an 8 Å contact threshold."
+        a = (
+            "```python\n"
+            "import biotite.structure.io.pdbx as pdbx\n"
+            "import biotite.structure as struc\n"
+            "import numpy as np\n\n"
+            f"cif = pdbx.CIFFile.read('{path.name}')\n"
+            "arr = pdbx.get_structure(cif, model=1)\n"
+            "ca = arr[(arr.atom_name == 'CA') & struc.filter_amino_acids(arr)]\n"
+            "dist = np.linalg.norm(ca.coord[:, None, :] - ca.coord[None, :, :], axis=-1)\n"
+            "contact_map = dist < 8.0\n"
+            "```\n\n"
+            f"For {pid}'s real deposited coordinates ({len(ca)} residues), {contacts:,} Cα-Cα pairs "
+            f"fall within the 8 Å contact threshold (excluding self-contacts). The rendered heatmap's "
+            f"characteristic diagonal band is local backbone proximity; off-diagonal blocks/streaks "
+            f"mark real tertiary contacts — domain boundaries typically show up as block structure, "
+            f"and beta-sheets as parallel off-diagonal stripes."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_bfactor_plot(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real per-residue B-factor extracted directly from native mmCIF via
+    biotite (extra_fields=['b_factor']), plotted along the sequence."""
+    import biotite.structure.io.pdbx as pdbx
+    import biotite.structure as struc
+    import numpy as np
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        try:
+            cif = pdbx.CIFFile.read(str(path))
+            arr = pdbx.get_structure(cif, model=1, extra_fields=["b_factor"])
+            ca = arr[(arr.atom_name == "CA") & struc.filter_amino_acids(arr)]
+            if len(ca) < 10:
+                continue
+            bfactors = ca.b_factor
+            with tempfile.TemporaryDirectory() as tmpdir:
+                png_path = Path(tmpdir) / "bfactor.png"
+                fig, ax = plt.subplots(figsize=(max(6, len(ca) * 0.03), 2.5))
+                ax.plot(range(len(bfactors)), bfactors, color="steelblue", lw=1)
+                ax.set_xlabel("Residue index")
+                ax.set_ylabel("B-factor")
+                fig.tight_layout()
+                fig.savefig(png_path, dpi=100)
+                plt.close(fig)
+                if not png_path.exists() or png_path.stat().st_size < 500:
+                    continue
+            mean_b, max_b = float(np.mean(bfactors)), float(np.max(bfactors))
+            flexible_resi = int(np.argmax(bfactors))
+        except Exception:
+            continue
+        pid = path.stem.upper()
+        q = f"Plot per-residue B-factors along the sequence for PDB entry {pid} (mmCIF file `{path.name}`) and identify the most flexible region."
+        a = (
+            "```python\n"
+            "import biotite.structure.io.pdbx as pdbx\n"
+            "import biotite.structure as struc\n\n"
+            f"cif = pdbx.CIFFile.read('{path.name}')\n"
+            "arr = pdbx.get_structure(cif, model=1, extra_fields=['b_factor'])\n"
+            "ca = arr[(arr.atom_name == 'CA') & struc.filter_amino_acids(arr)]\n"
+            "plt.plot(ca.b_factor)\n"
+            "```\n\n"
+            f"For {pid}'s real deposited coordinates ({len(ca)} CA atoms): mean B-factor {mean_b:.1f}, "
+            f"max {max_b:.1f} at residue index {flexible_resi} (0-based, CA-only ordering). High "
+            f"B-factor regions typically mark real conformational flexibility or weaker experimental "
+            f"support (loops, termini) rather than genuine rigidity — worth cross-checking against "
+            f"whether the region sits at a chain terminus before reading too much biology into it."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_py3dmol_view(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: a real self-contained interactive HTML view built with py3Dmol from a
+    real structure file, confirmed to actually render non-trivial HTML output -- the embeddable/
+    interactive complement to PyMOL/ChimeraX's static ray-traced PNGs."""
+    import py3Dmol
+
+    styles = [
+        ("cartoon", "spectrum", "cmd.setStyle({'cartoon': {'color': 'spectrum'}})"),
+        ("cartoon", "chain", "cmd.setStyle({'cartoon': {'colorscheme': 'chainHetatm'}})"),
+        ("stick", "element", "cmd.setStyle({'stick': {'colorscheme': 'default'}})"),
+        ("sphere", "element", "cmd.setStyle({'sphere': {'colorscheme': 'default'}})"),
+    ]
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 3, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        style_name, color_name, style_call = rng.choice(styles)
+        try:
+            data = path.read_text()
+            view = py3Dmol.view(width=600, height=600)
+            view.addModel(data, "cif")
+            style_key = {"cartoon": {"cartoon": {}}, "stick": {"stick": {}}, "sphere": {"sphere": {}}}[style_name]
+            view.setStyle(style_key)
+            view.zoomTo()
+            html = view._make_html()
+            if len(html) < 5000:
+                continue
+        except Exception:
+            continue
+        pid = path.stem.upper()
+        q = f"Generate a self-contained interactive HTML viewer for PDB entry {pid} (mmCIF file `{path.name}`) using py3Dmol, styled as {style_name}."
+        a = (
+            "```python\n"
+            "import py3Dmol\n\n"
+            "view = py3Dmol.view(width=600, height=600)\n"
+            f"view.addModel(open('{path.name}').read(), 'cif')\n"
+            f"view.setStyle({{'{style_name}': {{}}}})\n"
+            "view.zoomTo()\n"
+            "html = view._make_html()  # self-contained: embeds 3Dmol.js + the structure data inline\n"
+            "with open('viewer.html', 'w') as f:\n"
+            "    f.write(html)\n"
+            "```\n\n"
+            f"This renders {pid}'s real deposited coordinates into a {len(html):,}-character "
+            f"self-contained interactive HTML file (confirmed non-trivial output, not a stub) -- "
+            f"unlike PyMOL/ChimeraX's static ray-traced PNGs, this can be opened directly in any "
+            f"browser and rotated/zoomed live, a good fit for embedding in a report or webpage."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+PDBTOOLS_TASKS: list[tuple[str, "callable", list[str]]] = [
+    ("keep only chain A", lambda: ["pdb_selchain", "-A"], "pdb_selchain"),
+    ("remove all HETATM records (ligands/cofactors)", lambda: ["pdb_delhetatm"], "pdb_delhetatm"),
+    ("remove all water molecules", lambda: ["pdb_delresname", "-HOH"], "pdb_delresname"),
+    ("tidy up the file (fix formatting, add TER/END records)", lambda: ["pdb_tidy"], "pdb_tidy"),
+    ("keep only residues 1 through 50", lambda: ["pdb_selres", "-1:50"], "pdb_selres"),
+]
+
+
+def gen_pdbtools_manipulation(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real pdb-tools (https://github.com/haddocking/pdb-tools) invocations
+    against real structure files (converted to legacy PDB, pdb-tools' native format, same
+    conversion DSSP/FreeSASA/PLIP/PyMOL already rely on)."""
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        task_desc, args_fn, tool_name = rng.choice(PDBTOOLS_TASKS)
+        tool_bin = shutil.which(tool_name)
+        if not tool_bin:
+            continue
+        pdb_tmp = None
+        try:
+            pdb_tmp = Path(_gemmi_to_pdb(path))
+            result = subprocess.run(
+                [tool_bin] + args_fn()[1:] + [str(pdb_tmp)],
+                capture_output=True, text=True, timeout=30,
+            )
+            n_atoms_before = pdb_tmp.read_text().count("\nATOM") + pdb_tmp.read_text().count("\nHETATM")
+            n_lines_out = len([l for l in result.stdout.split("\n") if l.startswith(("ATOM", "HETATM"))])
+            if result.returncode != 0 or not result.stdout.strip():
+                continue
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+            continue
+        except Exception:
+            # e.g. gemmi.write_pdb's RuntimeError on chain names >1 char (legacy PDB format
+            # limit) -- a real large-assembly structure crashed the whole 100k-example build
+            # here mid-run before this was added, confirmed live 2026-07-18.
+            continue
+        finally:
+            if pdb_tmp:
+                pdb_tmp.unlink(missing_ok=True)
+        pid = path.stem.upper()
+        cmd_str = " ".join([tool_name] + args_fn()[1:] + [f"{pid.lower()}.pdb"])
+        q = f"Use pdb-tools to {task_desc} in PDB entry {pid}."
+        a = (
+            "```bash\n" + cmd_str + "\n```\n\n"
+            f"Running this against the real deposited coordinates for {pid} ({n_atoms_before:,} atom "
+            f"records in the original file) produces {n_lines_out:,} ATOM/HETATM lines in the "
+            f"filtered output -- {tool_name} writes the result to stdout, so redirect it "
+            f"(`> output.pdb`) to save."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_topology_schematic(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: a real, computed linear secondary-structure topology schematic built
+    from the same real DSSP assignment _run_dssp_ordered uses, rendered as helices (rounded boxes)
+    and strands (arrows) in real sequence order via matplotlib. Deliberately smaller in scope than
+    a full 2D fold-topology diagram (Pro-origami/PDBsum-style, with strand crossings/connectivity
+    laid out spatially) -- FlatProt, the one real current tool for that, requires Python <3.14 and
+    chatPDB's venv runs 3.14.6 (confirmed via `pip install flatprot --dry-run`, round 5 planning).
+    This is the honest fallback: real computed SSE order and extent, not a fabricated substitute."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import FancyBboxPatch, FancyArrow
+
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        ss_list = _run_dssp_ordered(path)
+        if not ss_list or len(ss_list) < 20:
+            continue
+        # collapse to runs: (type, start, end) where type in {H, E, L}
+        def _bucket(ss):
+            return "H" if ss in "HGI" else "E" if ss in "EB" else "L"
+        runs = []
+        cur_type, cur_start = _bucket(ss_list[0]), 0
+        for i in range(1, len(ss_list)):
+            t = _bucket(ss_list[i])
+            if t != cur_type:
+                runs.append((cur_type, cur_start, i))
+                cur_type, cur_start = t, i
+        runs.append((cur_type, cur_start, len(ss_list)))
+        n_helix = sum(1 for t, s, e in runs if t == "H")
+        n_strand = sum(1 for t, s, e in runs if t == "E")
+        if n_helix + n_strand < 2:
+            continue
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                png_path = Path(tmpdir) / "topology.png"
+                fig, ax = plt.subplots(figsize=(max(6, len(ss_list) * 0.04), 1.5))
+                for t, s, e in runs:
+                    if t == "H":
+                        ax.add_patch(FancyBboxPatch((s, -0.3), e - s, 0.6, boxstyle="round,pad=0.02",
+                                                      facecolor="tomato", edgecolor="black"))
+                    elif t == "E":
+                        ax.add_patch(FancyArrow(s, 0, e - s, 0, width=0.5, head_width=0.9,
+                                                  head_length=min(3, (e - s) * 0.4),
+                                                  facecolor="gold", edgecolor="black", length_includes_head=True))
+                    else:
+                        ax.plot([s, e], [0, 0], color="gray", lw=1.5)
+                ax.set_xlim(0, len(ss_list))
+                ax.set_ylim(-1, 1)
+                ax.set_yticks([])
+                ax.set_xlabel("Residue index")
+                fig.tight_layout()
+                fig.savefig(png_path, dpi=100)
+                plt.close(fig)
+                if not png_path.exists() or png_path.stat().st_size < 500:
+                    continue
+        except Exception:
+            continue
+        pid = path.stem.upper()
+        order = "-".join(t for t, s, e in runs if t != "L")
+        q = f"Draw a 2D secondary-structure topology schematic for PDB entry {pid} (mmCIF file `{path.name}`), showing helices and strands in sequence order."
+        a = (
+            "```python\n"
+            "from Bio.PDB import MMCIFParser\n"
+            "from Bio.PDB.DSSP import DSSP\n"
+            "import matplotlib.pyplot as plt\n"
+            "from matplotlib.patches import FancyBboxPatch, FancyArrow\n\n"
+            "# real per-residue DSSP assignment, collapsed into helix/strand/loop runs, then drawn\n"
+            "# left-to-right in real sequence order: helices as rounded boxes, strands as arrows\n"
+            "```\n\n"
+            f"{pid}'s real DSSP assignment collapses into {len(runs)} secondary-structure segments: "
+            f"{n_helix} helices, {n_strand} strands, in linear sequence order {order}. Note: this is "
+            f"a *linear* topology schematic (element order and extent only) rather than a full "
+            f"spatial 2D fold diagram with strand-crossing connectivity (the PDBsum/Pro-origami "
+            f"style) -- no currently-installable local tool produces that (FlatProt requires an "
+            f"older Python than this environment runs); this schematic is real and computed, not a "
+            f"substitute claiming to be something it isn't."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_pdb2pqr_prep(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real PDB2PQR protonation-state assignment + partial-charge/radius
+    parameterization against a real structure file -- the real preprocessing step ahead of any
+    electrostatics calculation (ChimeraX's `coulombic` command, already covered by the round-5
+    ChimeraX command corpus, is the actual potential-calculation half)."""
+    pdb2pqr_bin = shutil.which("pdb2pqr30")
+    if not pdb2pqr_bin:
+        return []
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        pdb_tmp = None
+        try:
+            pdb_tmp = Path(_gemmi_to_pdb(path))
+            with tempfile.TemporaryDirectory() as tmpdir:
+                pqr_path = Path(tmpdir) / "out.pqr"
+                result = subprocess.run(
+                    [pdb2pqr_bin, "--ff=AMBER", str(pdb_tmp), str(pqr_path)],
+                    capture_output=True, text=True, timeout=90,
+                )
+                if result.returncode != 0 or not pqr_path.exists():
+                    continue
+                total_charge = 0.0
+                n_atoms = 0
+                for line in pqr_path.read_text().split("\n"):
+                    if line.startswith(("ATOM", "HETATM")):
+                        parts = line.split()
+                        total_charge += float(parts[-2])
+                        n_atoms += 1
+                if n_atoms == 0:
+                    continue
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, ValueError, IndexError):
+            continue
+        except Exception:
+            continue
+        finally:
+            if pdb_tmp:
+                pdb_tmp.unlink(missing_ok=True)
+        pid = path.stem.upper()
+        q = f"Run PDB2PQR on PDB entry {pid} to assign protonation states and partial charges/radii ahead of an electrostatics calculation, using the AMBER force field."
+        a = (
+            "```bash\n"
+            f"pdb2pqr30 --ff=AMBER {pid.lower()}.pdb {pid.lower()}.pqr\n"
+            "```\n\n"
+            f"Running this against the real deposited coordinates for {pid} assigns real per-atom "
+            f"partial charges and radii (AMBER force field) to all {n_atoms:,} atoms, writing a real "
+            f".pqr file; the net charge sums to {total_charge:+.2f} e. This .pqr output is the real "
+            f"preprocessing step ahead of a Poisson-Boltzmann or Coulombic electrostatics "
+            f"calculation -- e.g. ChimeraX's `coulombic` command, or APBS if you need full "
+            f"Poisson-Boltzmann rather than a simpler Coulombic approximation."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def _small_structure_files(structure_files: list[Path], entries_df: pd.DataFrame,
+                            max_atoms: int = 1200) -> list[Path]:
+    """Filter to small real *protein* structures for the MD/crystallography/docking generators
+    below -- keeps energy-minimization/refinement/docking runs fast (a few seconds each, not
+    minutes), matching the round-5 plan's runtime mitigation (fixed small sample counts, capped
+    structure size, low iteration counts, rather than scaling with per_class the way lighter
+    generators do). Protein-only: protein force fields (amber99sb-ildn/amber14) don't have residue
+    templates for bare DNA/RNA chains, which pdb2gmx/OpenMM will reject."""
+    small_ids = set(entries_df[
+        (entries_df["atom_count"] > 200) & (entries_df["atom_count"] < max_atoms) &
+        (entries_df["protein_entity_count"] > 0) & (entries_df["nucleic_acid_entity_count"] == 0)
+    ]["pdb_id"].str.lower())
+    return [p for p in structure_files if p.stem in small_ids]
+
+
+def gen_openmm_script(structure_files: list[Path], entries_df: pd.DataFrame,
+                       rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: a real OpenMM energy minimization run (implicit solvent, AMBER14) on a
+    real small protein structure -- computes real potential energy before/after, not a templated
+    guess. Deliberately scoped to minimization (+ implicit solvent, no explicit-water box) rather
+    than production MD: a real trajectory run is out of scope for per-example corpus generation
+    (would blow up total build runtime the way fpocket's long tail did in round 4) -- this teaches
+    the real OpenMM setup/run/analyze workflow end-to-end without that cost."""
+    small_files = _small_structure_files(structure_files, entries_df, max_atoms=900)
+    if not small_files:
+        return []
+    from openmm.app import PDBFile, ForceField, Modeller, Simulation, NoCutoff
+    from openmm import LangevinMiddleIntegrator, unit
+    import gemmi
+
+    out = []
+    candidates = rng.sample(small_files, k=min(n * 6, len(small_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                clean_pdb = Path(tmpdir) / "clean.pdb"
+                st = gemmi.read_structure(str(path))
+                st.setup_entities()
+                st.remove_ligands_and_waters()
+                st.remove_empty_chains()
+                st.write_pdb(str(clean_pdb))
+
+                pdb = PDBFile(str(clean_pdb))
+                modeller = Modeller(pdb.topology, pdb.positions)
+                ff = ForceField("amber14-all.xml", "implicit/gbn2.xml")
+                modeller.addHydrogens(ff)
+                if modeller.topology.getNumAtoms() > 6000:
+                    continue  # keep runtime bounded after implicit hydrogens are added
+                system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff)
+                integrator = LangevinMiddleIntegrator(300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds)
+                sim = Simulation(modeller.topology, system, integrator)
+                sim.context.setPositions(modeller.positions)
+                e_before = sim.context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+                sim.minimizeEnergy(maxIterations=200)
+                e_after = sim.context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+                if not (e_after == e_after) or not (e_before == e_before):  # nan check, no math import needed
+                    continue
+                n_atoms = modeller.topology.getNumAtoms()
+        except Exception:
+            continue
+        pid = path.stem.upper()
+        q = f"Write and run an OpenMM script to energy-minimize PDB entry {pid} (implicit solvent) and report the potential energy before and after."
+        a = (
+            "```python\n"
+            "from openmm.app import PDBFile, ForceField, Modeller, Simulation, NoCutoff\n"
+            "from openmm import LangevinMiddleIntegrator, unit\n\n"
+            f"pdb = PDBFile('{pid.lower()}_clean.pdb')  # ligands/waters stripped first\n"
+            "modeller = Modeller(pdb.topology, pdb.positions)\n"
+            "ff = ForceField('amber14-all.xml', 'implicit/gbn2.xml')\n"
+            "modeller.addHydrogens(ff)\n"
+            "system = ff.createSystem(modeller.topology, nonbondedMethod=NoCutoff)\n"
+            "integrator = LangevinMiddleIntegrator(300*unit.kelvin, 1/unit.picosecond, 0.002*unit.picoseconds)\n"
+            "sim = Simulation(modeller.topology, system, integrator)\n"
+            "sim.context.setPositions(modeller.positions)\n"
+            "e_before = sim.context.getState(getEnergy=True).getPotentialEnergy()\n"
+            "sim.minimizeEnergy(maxIterations=200)\n"
+            "e_after = sim.context.getState(getEnergy=True).getPotentialEnergy()\n"
+            "```\n\n"
+            f"Running this on {pid}'s real deposited coordinates ({n_atoms:,} atoms after adding "
+            f"hydrogens, AMBER14 force field, GBN2 implicit solvent): potential energy went from "
+            f"{e_before:,.0f} kJ/mol to {e_after:,.0f} kJ/mol after 200 steps of steepest-descent "
+            f"minimization -- a real, computed energy drop, not an estimate. This is a minimization "
+            f"run (relaxing steric clashes/strain in the deposited model), not production molecular "
+            f"dynamics; a real MD trajectory would follow this with `sim.step(n)` and reporters."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_gromacs_pipeline(structure_files: list[Path], entries_df: pd.DataFrame,
+                          rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: a real GROMACS CLI pipeline (pdb2gmx -> editconf -> solvate -> grompp ->
+    mdrun) on a real small protein structure, explicit-water energy minimization. Same
+    minimization-only scoping as gen_openmm_script above, for the same runtime reason -- teaches the
+    real GROMACS file-based workflow (.gro/.top/.mdp), not a production MD trajectory."""
+    gmx_bin = shutil.which("gmx")
+    if not gmx_bin:
+        return []
+    small_files = _small_structure_files(structure_files, entries_df, max_atoms=900)
+    if not small_files:
+        return []
+    import gemmi
+
+    em_mdp = (
+        "integrator  = steep\nemtol       = 1000.0\nemstep      = 0.01\nnsteps      = 200\n"
+        "nstlist     = 10\ncutoff-scheme = Verlet\ncoulombtype = PME\nrcoulomb    = 1.0\n"
+        "rvdw        = 1.0\npbc         = xyz\n"
+    )
+    out = []
+    candidates = rng.sample(small_files, k=min(n * 8, len(small_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                td = Path(tmpdir)
+                clean_pdb = td / "clean.pdb"
+                st = gemmi.read_structure(str(path))
+                st.setup_entities()
+                st.remove_ligands_and_waters()
+                st.remove_empty_chains()
+                st.write_pdb(str(clean_pdb))
+                (td / "em.mdp").write_text(em_mdp)
+
+                def run(args, timeout=30):
+                    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=td)
+
+                r1 = run([gmx_bin, "pdb2gmx", "-f", str(clean_pdb), "-o", "processed.gro",
+                          "-p", "topol.top", "-water", "spce", "-ff", "amber99sb-ildn", "-ignh"])
+                if r1.returncode != 0:
+                    continue
+                r2 = run([gmx_bin, "editconf", "-f", "processed.gro", "-o", "boxed.gro",
+                          "-c", "-d", "1.0", "-bt", "cubic"])
+                if r2.returncode != 0:
+                    continue
+                r3 = run([gmx_bin, "solvate", "-cp", "boxed.gro", "-cs", "spc216.gro",
+                          "-o", "solvated.gro", "-p", "topol.top"])
+                if r3.returncode != 0:
+                    continue
+                r4 = run([gmx_bin, "grompp", "-f", "em.mdp", "-c", "solvated.gro",
+                          "-p", "topol.top", "-o", "em.tpr", "-maxwarn", "2"])
+                if r4.returncode != 0:
+                    continue
+                r5 = run([gmx_bin, "mdrun", "-deffnm", "em", "-nt", "2"], timeout=60)
+                if r5.returncode != 0:
+                    continue
+                # GROMACS writes its run summary (incl. "Potential Energy = ...") to stderr, not
+                # stdout -- confirmed live, the initial version of this generator checked stdout
+                # and silently produced zero examples until this was caught by execution testing.
+                pe_line = next((l for l in r5.stderr.split("\n") if "Potential Energy" in l), None)
+                if not pe_line:
+                    continue
+                final_pe = float(pe_line.split("=")[1].split()[0])
+                n_waters_line = next((l for l in r3.stdout.split("\n") if "molecules" in l.lower()), "")
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, ValueError, IndexError):
+            continue
+        except Exception:
+            continue
+        pid = path.stem.upper()
+        q = f"Set up and run a GROMACS energy-minimization pipeline for PDB entry {pid} in explicit water, and report the final potential energy."
+        a = (
+            "```bash\n"
+            f"gmx pdb2gmx -f {pid.lower()}_clean.pdb -o processed.gro -p topol.top -water spce -ff amber99sb-ildn -ignh\n"
+            "gmx editconf -f processed.gro -o boxed.gro -c -d 1.0 -bt cubic\n"
+            "gmx solvate -cp boxed.gro -cs spc216.gro -o solvated.gro -p topol.top\n"
+            "gmx grompp -f em.mdp -c solvated.gro -p topol.top -o em.tpr -maxwarn 2\n"
+            "gmx mdrun -deffnm em\n"
+            "gmx energy -f em.edr -o energy.xvg   # select 'Potential' interactively\n"
+            "```\n\n"
+            f"em.mdp: steepest-descent minimization, 200 steps, PME electrostatics. Running this "
+            f"real pipeline against {pid}'s deposited coordinates (ligands/waters stripped, "
+            f"re-solvated in explicit SPC/E water, Amber99sb-ildn force field): final potential "
+            f"energy {final_pe:,.0f} kJ/mol. This is the standard GROMACS file-based workflow "
+            f"(.gro coordinates, .top topology, .mdp run parameters, .tpr portable run input) -- "
+            f"minimization only here; production MD would continue with a longer `mdrun` using an "
+            f"NVT/NPT equilibration .mdp before a production .mdp."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Crystallography (round 5): CCP4 (/Applications/ccp4-9, confirmed live: cif2mtz, ctruncate,
+# refmac5 all real and working) + PHENIX (/Applications/phenix-2.1-6048, confirmed live:
+# phenix.refine, phenix.molprobity both real and working). Deposited PDB structure-factor files
+# only carry merged/scaled reflection data (not raw diffraction images), so this covers refmac5/
+# ctruncate/phenix.refine/phenix.molprobity -- real tools that work on merged SF data -- not
+# aimless/pointless (unmerged-data scaling), which genuinely can't be exercised from this data
+# source. Cached locally (data/cache/crystallography/) since fetching + converting real SF data is
+# too slow to redo per example.
+# ---------------------------------------------------------------------------
+
+CCP4_SETUP = "source /Applications/ccp4-9/bin/ccp4.setup-sh"
+PHENIX_SETUP = "source /Applications/phenix-2.1-6048/phenix_env.sh"
+CRYSTALLOGRAPHY_CACHE = Path("data/cache/crystallography")
+
+
+def _run_shell(cmd: str, cwd: Path, timeout: int = 60) -> subprocess.CompletedProcess:
+    """Run a command string through a login-ish shell with CCP4's env sourced first -- CCP4/PHENIX
+    binaries both require their own setup script to be sourced (sets PATH, library paths, etc.),
+    which only takes effect within the same shell invocation, not via subprocess.run's normal
+    argv-list form."""
+    return subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=timeout, cwd=cwd)
+
+
+def _prepare_mtz(pdb_id: str) -> tuple[Path, Path, str, str] | None:
+    """Fetch real deposited structure factors for pdb_id, convert to a real MTZ with real F/SIGF
+    amplitude columns (running ctruncate first if the deposit is intensities, as ~half of real
+    deposits are), and cache the result. Returns (pdb_path, mtz_path, f_col, sigf_col) or None if
+    this entry has no deposited SF data (common for older/legacy entries) or conversion fails.
+    Cached to data/cache/crystallography/{pid}/ so repeated generator calls across gen_mtz_
+    manipulation/gen_ccp4_refmac_script/gen_phenix_refine_script/gen_phenix_molprobity reuse the
+    same real download+conversion instead of redoing it."""
+    import gemmi
+
+    cache_dir = CRYSTALLOGRAPHY_CACHE / pdb_id.lower()
+    meta_path = cache_dir / "meta.txt"
+    mtz_path = cache_dir / "data.mtz"
+    pdb_path = cache_dir / "model.pdb"
+    fail_marker = cache_dir / "FAILED"
+    if fail_marker.exists():
+        return None
+    if meta_path.exists() and mtz_path.exists() and pdb_path.exists():
+        f_col, sigf_col = meta_path.read_text().strip().split(",")
+        return pdb_path.resolve(), mtz_path.resolve(), f_col, sigf_col
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    struct_path = STRUCTURES / f"{pdb_id.lower()}.cif"
+    if not struct_path.exists():
+        fail_marker.touch()
+        return None
+    try:
+        import requests
+        resp = requests.get(f"https://files.rcsb.org/download/{pdb_id.upper()}-sf.cif.gz", timeout=30)
+        if resp.status_code != 200:
+            fail_marker.touch()
+            return None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            td = Path(tmpdir)
+            sf_gz = td / "sf.cif.gz"
+            sf_gz.write_bytes(resp.content)
+            subprocess.run(["gunzip", "-f", str(sf_gz)], check=True, timeout=30)
+            sf_cif = td / "sf.cif"
+
+            r = _run_shell(f"{CCP4_SETUP} && cif2mtz HKLIN {sf_cif} HKLOUT {td}/raw.mtz << 'EOF'\nEND\nEOF", td)
+            raw_mtz = td / "raw.mtz"
+            if r.returncode != 0 or not raw_mtz.exists():
+                fail_marker.touch()
+                return None
+
+            mtz = gemmi.read_mtz_file(str(raw_mtz))
+            labels = {c.label: c.type for c in mtz.columns}
+            has_free = "FREE" in labels
+            if "FP" in labels and "SIGFP" in labels:
+                final_mtz, f_col, sigf_col = raw_mtz, "FP", "SIGFP"
+            elif "F" in labels and "SIGF" in labels:
+                final_mtz, f_col, sigf_col = raw_mtz, "F", "SIGF"
+            elif "I" in labels and "SIGI" in labels and has_free:
+                r2 = _run_shell(
+                    f"{CCP4_SETUP} && ctruncate -hklin {td}/raw.mtz -hklout {td}/trunc.mtz "
+                    f"-colin '/*/*/[I,SIGI]' -freein '/*/*/[FREE]'", td, timeout=60,
+                )
+                trunc_mtz = td / "trunc.mtz"
+                if r2.returncode != 0 or not trunc_mtz.exists():
+                    fail_marker.touch()
+                    return None
+                final_mtz, f_col, sigf_col = trunc_mtz, "F", "SIGF"
+            else:
+                fail_marker.touch()
+                return None
+            if not has_free:
+                fail_marker.touch()
+                return None
+
+            st = gemmi.read_structure(str(struct_path))
+            st.setup_entities()
+            st.write_pdb(str(pdb_path))
+            shutil.copy(final_mtz, mtz_path)
+            meta_path.write_text(f"{f_col},{sigf_col}")
+            return pdb_path.resolve(), mtz_path.resolve(), f_col, sigf_col
+    except Exception:
+        fail_marker.touch()
+        return None
+
+
+def _crystallography_pool(structure_files: list[Path], entries_df: pd.DataFrame,
+                           rng: random.Random, target_n: int) -> list[tuple[str, Path, Path, str, str]]:
+    """Build (or reuse the cached) pool of real (pdb_id, pdb_path, mtz_path, f_col, sigf_col)
+    tuples the four crystallography generators below sample from."""
+    small_ids = set(entries_df[
+        (entries_df["method"] == "X-RAY DIFFRACTION") &
+        (entries_df["atom_count"] > 400) & (entries_df["atom_count"] < 3000) &
+        (entries_df["protein_entity_count"] > 0) & (entries_df["nucleic_acid_entity_count"] == 0)
+    ]["pdb_id"].str.lower())
+    candidates = [p.stem for p in structure_files if p.stem in small_ids]
+    rng.shuffle(candidates)
+    pool = []
+    for pid in candidates:
+        if len(pool) >= target_n:
+            break
+        result = _prepare_mtz(pid.upper())
+        if result:
+            pdb_path, mtz_path, f_col, sigf_col = result
+            pool.append((pid.upper(), pdb_path, mtz_path, f_col, sigf_col))
+    return pool
+
+
+def gen_mtz_manipulation(pool: list[tuple[str, Path, Path, str, str]], n: int) -> list[dict]:
+    """Execution-verified: real gemmi.Mtz read/summary against real deposited reflection data
+    (column listing, resolution range, spacegroup) -- general MTZ literacy, no CCP4/PHENIX needed.
+    Takes the shared pool built once in main() (see _crystallography_pool) -- each of the 4
+    crystallography generators used to build its own pool independently, which meant they didn't
+    share already-downloaded/converted entries and repeated slow network fetches for no reason;
+    caught during round-5 smoke testing (`sample`-based profiling showed real HTTPS I/O to RCSB
+    still running long after the pool should have been warm)."""
+    import gemmi
+    out = []
+    for pid, pdb_path, mtz_path, f_col, sigf_col in pool:
+        if len(out) >= n:
+            break
+        try:
+            mtz = gemmi.read_mtz_file(str(mtz_path))
+            n_refl = mtz.nreflections
+            d_min, d_max = mtz.resolution_high(), mtz.resolution_low()
+            sg = mtz.spacegroup.hm
+            cols = ", ".join(f"{c.label} ({c.type})" for c in mtz.columns)
+        except Exception:
+            continue
+        q = f"Read the MTZ reflection file for PDB entry {pid} with gemmi and summarise its contents (columns, resolution range, spacegroup)."
+        a = (
+            "```python\n"
+            "import gemmi\n\n"
+            f"mtz = gemmi.read_mtz_file('{pid.lower()}.mtz')\n"
+            "print('Reflections:', mtz.nreflections)\n"
+            "print('Resolution:', mtz.resolution_high(), '-', mtz.resolution_low())\n"
+            "print('Space group:', mtz.spacegroup.hm)\n"
+            "print('Columns:', [c.label for c in mtz.columns])\n"
+            "```\n\n"
+            f"{pid}'s real deposited reflection data: {n_refl:,} reflections, resolution "
+            f"{d_min:.2f}-{d_max:.2f} Å, space group {sg}. Columns: {cols}. This MTZ was built "
+            f"directly from {pid}'s real deposited structure-factor file (RCSB `-sf.cif.gz`), "
+            f"converted with CCP4's `cif2mtz`{' + ctruncate (intensity to amplitude conversion)' if f_col == 'F' else ''}."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_ccp4_refmac_script(pool: list[tuple[str, Path, Path, str, str]], n: int) -> list[dict]:
+    """Execution-verified: a real refmac5 refinement run (CCP4) against a real deposited PDB model
+    + its own real deposited reflection data -- genuine R-factor/R-free numbers from an actual
+    refinement, not templated. Shared pool -- see gen_mtz_manipulation's docstring."""
+    out = []
+    for pid, pdb_path, mtz_path, f_col, sigf_col in pool:
+        if len(out) >= n:
+            break
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                td = Path(tmpdir)
+                script = (
+                    f"{CCP4_SETUP} && refmac5 XYZIN {pdb_path} HKLIN {mtz_path} "
+                    f"XYZOUT {td}/out.pdb HKLOUT {td}/out.mtz << 'EOF'\n"
+                    f"LABIN FP={f_col} SIGFP={sigf_col} FREE=FREE\nNCYC 3\nEND\nEOF"
+                )
+                r = _run_shell(script, td, timeout=90)
+                lines = r.stdout.split("\n")
+                result_idx = next((i for i, l in enumerate(lines) if "Final results" in l), None)
+                if result_idx is None or not (td / "out.pdb").exists():
+                    continue
+                r_line = next(l for l in lines[result_idx:] if "R factor" in l)
+                rfree_line = next(l for l in lines[result_idx:] if "R free" in l)
+                r_init, r_final = r_line.split()[-2], r_line.split()[-1]
+                rfree_init, rfree_final = rfree_line.split()[-2], rfree_line.split()[-1]
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError, StopIteration):
+            continue
+        except Exception:
+            continue
+        q = f"Write and run a CCP4 refmac5 script to refine PDB entry {pid} against its own deposited reflection data for 3 cycles, and report the R-factor/R-free before and after."
+        a = (
+            "```bash\n"
+            f"{CCP4_SETUP}\n"
+            f"refmac5 XYZIN {pid.lower()}.pdb HKLIN {pid.lower()}.mtz XYZOUT out.pdb HKLOUT out.mtz << EOF\n"
+            f"LABIN FP={f_col} SIGFP={sigf_col} FREE=FREE\nNCYC 3\nEND\nEOF\n"
+            "```\n\n"
+            f"Running real refmac5 refinement on {pid}'s deposited model against its own deposited "
+            f"reflection data (3 cycles, maximum-likelihood target): R-factor {r_init} -> {r_final}, "
+            f"R-free {rfree_init} -> {rfree_final}. Since {pid}'s deposited model was already "
+            f"refined by its original depositors, small further movement here is expected and "
+            f"doesn't imply the original refinement was wrong -- refmac5's exact restraint weights "
+            f"and starting B-factors differ slightly from whatever pipeline produced the deposited "
+            f"model."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_phenix_refine_script(pool: list[tuple[str, Path, Path, str, str]], n: int) -> list[dict]:
+    """Execution-verified: a real phenix.refine run against a real deposited PDB model + its own
+    real deposited reflection data. Shared pool -- see gen_mtz_manipulation's docstring."""
+    out = []
+    for pid, pdb_path, mtz_path, f_col, sigf_col in pool:
+        if len(out) >= n:
+            break
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                td = Path(tmpdir)
+                script = (
+                    f"{PHENIX_SETUP} && phenix.refine {pdb_path} {mtz_path} "
+                    f"main.number_of_macro_cycles=1 --overwrite"
+                )
+                r = _run_shell(script, td, timeout=180)
+                m = next((l for l in r.stdout.split("\n") if l.startswith("Start R-work")), None)
+                m2 = next((l for l in r.stdout.split("\n") if l.startswith("Final R-work")), None)
+                if not m or not m2:
+                    continue
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+            continue
+        except Exception:
+            continue
+        q = f"Run PHENIX's phenix.refine on PDB entry {pid} against its own deposited reflection data for 1 macro-cycle, and report the R-work/R-free before and after."
+        a = (
+            "```bash\n"
+            f"{PHENIX_SETUP}\n"
+            f"phenix.refine {pid.lower()}.pdb {pid.lower()}.mtz main.number_of_macro_cycles=1\n"
+            "```\n\n"
+            f"Running real phenix.refine on {pid}'s deposited model against its own deposited "
+            f"reflection data (1 macro-cycle, phenix.refine's default maximum-likelihood target and "
+            f"bulk-solvent/scaling): {m}, {m2}. This is PHENIX's refinement engine -- the "
+            f"crystallography-suite equivalent of CCP4's refmac5, built on the same bundled cctbx "
+            f"library PHENIX uses for validation (phenix.molprobity) and structure-factor handling."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_phenix_molprobity(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: a real phenix.molprobity validation run against a real structure file --
+    revives round 4's abandoned standalone-cctbx/MolProbity generator (that git clone kept failing
+    on network transport errors) via PHENIX's own bundled, working cctbx build. No MTZ/reflection
+    data needed -- MolProbity validates model geometry alone."""
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 4, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        pdb_tmp = None
+        try:
+            pdb_tmp = Path(_gemmi_to_pdb(path))
+            with tempfile.TemporaryDirectory() as tmpdir:
+                td = Path(tmpdir)
+                script = f"{PHENIX_SETUP} && phenix.molprobity {pdb_tmp}"
+                r = _run_shell(script, td, timeout=120)
+                lines = r.stdout.split("\n")
+                summary_idx = next((i for i, l in enumerate(lines) if "Summary" in l), None)
+                if summary_idx is None:
+                    continue
+                summary = "\n".join(l.strip() for l in lines[summary_idx:summary_idx + 8] if l.strip())
+                score_line = next((l for l in lines if "MolProbity score" in l), None)
+                if not score_line:
+                    continue
+                mp_score = score_line.split("=")[1].strip()
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+            continue
+        except Exception:
+            continue
+        finally:
+            if pdb_tmp:
+                Path(pdb_tmp).unlink(missing_ok=True)
+        pid = path.stem.upper()
+        q = f"Run PHENIX's MolProbity validation on PDB entry {pid} (mmCIF file `{path.name}`) and report the overall MolProbity score."
+        a = (
+            "```bash\n"
+            f"{PHENIX_SETUP}\n"
+            f"phenix.molprobity {pid.lower()}.pdb\n"
+            "```\n\n"
+            f"Running real MolProbity validation (via PHENIX's bundled cctbx) on {pid}'s real "
+            f"deposited coordinates gives a MolProbity score of {mp_score} (lower is better -- "
+            f"roughly the resolution, in Å, at which a structure of this geometric quality would be "
+            f"expected). Full summary:\n\n{summary}"
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def _pdbqt_valid_records(path: Path) -> str:
+    """Vina's PDBQT parser only accepts a strict record whitelist -- real PDB header lines
+    (HEADER/TITLE/REMARK/HELIX/SHEET/etc, which OpenBabel/meeko both carry through from the input
+    file) make it reject the file outright. Filter to just the records Vina actually parses."""
+    keep = ("ROOT", "ENDROOT", "BRANCH", "ENDBRANCH", "TORSDOF", "ATOM", "HETATM", "TER")
+    return "\n".join(l for l in path.read_text().split("\n") if l.startswith(keep))
+
+
+def gen_autodock_vina_docking(structure_files: list[Path], twilight_df: pd.DataFrame,
+                               rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real AutoDock Vina docking of a real deposited ligand back into its own
+    real deposited receptor pocket (real receptor/ligand PDBQT prep via OpenBabel -- meeko's own
+    receptor preparation hit a reproducible internal error on real deposited structures in this
+    environment, confirmed across multiple test entries during round-5 planning; OpenBabel's
+    AutoDock plugin is the working substitute), real binding-affinity score from Vina's scoring
+    function. Small search box (20 A) centred on the ligand's own real deposited position, low
+    exhaustiveness -- this is a redocking sanity-check exercise, not a blind pocket search."""
+    obabel_bin = shutil.which("obabel")
+    if not obabel_bin:
+        return []
+    import gemmi
+    from vina import Vina
+
+    avail = {p.stem: p for p in structure_files}
+    candidates = twilight_df[
+        twilight_df["PDBID"].str.lower().isin(avail) & twilight_df["MolWt"].between(100, 500)
+    ][["PDBID", "LigNm"]].drop_duplicates().values.tolist()
+    rng.shuffle(candidates)
+    out = []
+    for pdb_id, lig_name in candidates:
+        if len(out) >= n:
+            break
+        lig_name = str(lig_name).strip()
+        pid = pdb_id.upper()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                td = Path(tmpdir)
+                st = gemmi.read_structure(str(avail[pdb_id.lower()]))
+                st.setup_entities()
+
+                lig_chain = next((c.name for c in st[0] for r in c if r.name == lig_name), None)
+                if lig_chain is None:
+                    continue
+                sel = gemmi.Selection(f"/1/{lig_chain}/({lig_name})")
+                lig_st = sel.copy_structure_selection(st)
+                lig_pdb = td / "ligand.pdb"
+                lig_st.write_pdb(str(lig_pdb))
+                lig_atoms = [l for l in lig_pdb.read_text().split("\n") if l.startswith(("ATOM", "HETATM"))]
+                if len(lig_atoms) < 5:
+                    continue
+                coords = [[float(l[30:38]), float(l[38:46]), float(l[46:54])] for l in lig_atoms]
+                import numpy as np
+                center = list(np.mean(coords, axis=0))
+
+                rec = st.clone()
+                rec.remove_ligands_and_waters()
+                rec.remove_empty_chains()
+                rec.remove_hydrogens()
+                rec.remove_alternative_conformations()
+                rec_pdb = td / "receptor.pdb"
+                rec.write_pdb(str(rec_pdb))
+
+                rec_pdbqt, lig_pdbqt = td / "receptor.pdbqt", td / "ligand.pdbqt"
+                r1 = subprocess.run([obabel_bin, str(rec_pdb), "-O", str(rec_pdbqt), "-xr"],
+                                     capture_output=True, text=True, timeout=30)
+                r2 = subprocess.run([obabel_bin, str(lig_pdb), "-O", str(lig_pdbqt), "--gen3d"],
+                                     capture_output=True, text=True, timeout=30)
+                if not rec_pdbqt.exists() or not lig_pdbqt.exists():
+                    continue
+                (td / "receptor_clean.pdbqt").write_text(_pdbqt_valid_records(rec_pdbqt))
+                (td / "ligand_clean.pdbqt").write_text(_pdbqt_valid_records(lig_pdbqt))
+
+                v = Vina(sf_name="vina")
+                v.set_receptor(str(td / "receptor_clean.pdbqt"))
+                v.set_ligand_from_file(str(td / "ligand_clean.pdbqt"))
+                v.compute_vina_maps(center=center, box_size=[20, 20, 20])
+                v.dock(exhaustiveness=4, n_poses=3)
+                energies = v.energies(n_poses=1)
+                if len(energies) == 0:
+                    continue
+                best_affinity = float(energies[0][0])
+        except Exception:
+            continue
+        q = f"Dock ligand {lig_name} back into PDB entry {pid}'s own binding pocket with AutoDock Vina and report the predicted binding affinity."
+        a = (
+            "```python\n"
+            "from vina import Vina\n\n"
+            "v = Vina(sf_name='vina')\n"
+            f"v.set_receptor('{pid.lower()}_receptor.pdbqt')\n"
+            f"v.set_ligand_from_file('{lig_name.lower()}.pdbqt')\n"
+            "v.compute_vina_maps(center=ligand_center, box_size=[20, 20, 20])  # centred on the real deposited ligand position\n"
+            "v.dock(exhaustiveness=4, n_poses=3)\n"
+            "print(v.energies(n_poses=1))\n"
+            "```\n\n"
+            f"Redocking {pid}'s real deposited ligand ({lig_name}) into its own real deposited "
+            f"binding pocket (receptor/ligand PDBQT prep via OpenBabel): Vina's top pose scores "
+            f"{best_affinity:.2f} kcal/mol. This is a redocking sanity check (search box centred on "
+            f"the ligand's own crystallographic position, not a blind pocket search) -- a good "
+            f"redocking result reproduces something close to the deposited pose, which is the "
+            f"standard way to validate a docking protocol before trusting it on a novel ligand."
         )
         out.append(make_example(q, a, "tool_calling"))
     return out
@@ -2555,6 +4124,21 @@ def gen_refusal_boundary(uniprot_df: pd.DataFrame, rng: random.Random, n: int) -
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def _safe_gen(fn, *args):
+    """Run a generator and swallow any exception it doesn't already handle internally, rather than
+    letting one unexpected edge case crash the entire multi-hour build and lose every example
+    generated so far -- output is only written to disk once, at the very end of main(). Added after
+    a real full-scale run crashed ~3 hours in on a gemmi RuntimeError (a legitimate large-assembly
+    structure with a >1-character chain name, which the legacy PDB format can't represent) that one
+    generator's narrower except clause didn't catch; every individual generator should still handle
+    its own expected failure modes precisely, this is a last-resort backstop, not a substitute."""
+    try:
+        return fn(*args)
+    except Exception as e:
+        print(f"  [error] {fn.__name__} raised {type(e).__name__}: {e} -- skipping, continuing with the rest of the build")
+        return []
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--n", type=int, default=50000, help="target total example count")
@@ -2574,59 +4158,98 @@ def main() -> None:
     # file_format_literacy — split across 5 generators
     k = per_class // 5
     print("Generating file_format_literacy ...")
-    all_examples += gen_atom_hetatm(c["entries"], rng, k)
-    all_examples += gen_ccd_component_format(c["ccd"], rng, k)
-    all_examples += gen_deposition_header(c["all_entries"], rng, k)
-    all_examples += gen_format_pdb_vs_mmcif(c["entries"][c["entries"]["atom_count"] > 20000], rng, k)
-    all_examples += gen_biological_assembly_asu(c["entries"], rng, k)
+    all_examples += _safe_gen(gen_atom_hetatm, c["entries"], rng, k)
+    all_examples += _safe_gen(gen_ccd_component_format, c["ccd"], rng, k)
+    all_examples += _safe_gen(gen_deposition_header, c["all_entries"], rng, k)
+    all_examples += _safe_gen(gen_format_pdb_vs_mmcif, c["entries"][c["entries"]["atom_count"] > 20000], rng, k)
+    all_examples += _safe_gen(gen_biological_assembly_asu, c["entries"], rng, k)
 
     # experimental_method — split across 16 generators. Round 4 added PDB-REDO refinement deltas,
     # EMDB map metadata, OPM membrane placement, the AlphaFraud rich comparison (replacing the
     # thin round-3 pLDDT-only one), the house structure-report-card format, and assembly biography.
     k = per_class // 16
     print("Generating experimental_method ...")
-    all_examples += gen_xray_resolution_quality(c["entries"], rng, k)
-    all_examples += gen_rfree_quality(c["entries"], rng, k)
-    all_examples += gen_em_resolution_quality(c["entries"], rng, k)
-    all_examples += gen_nmr_characteristics(c["entries"], rng, k)
-    all_examples += gen_twilight_ligand_fit(c["twilight"], rng, k)
-    all_examples += gen_unit_cell_space_group(c["entries"], rng, k)
-    all_examples += gen_crystallization_conditions(c["entries"], rng, k)
-    all_examples += gen_validation_geometry(c["validation"], c["entries"], rng, k)
-    all_examples += gen_alphafold_vs_experimental(c["alphafold"], c["entries"], c["sifts_uniprot"], rng, k)
-    all_examples += gen_multihop_structure_quality_full(c["entries"], c["validation"], rng, k)
-    all_examples += gen_pdbredo_refinement_delta(c["pdbredo"], c["entries"], rng, k)
-    all_examples += gen_emdb_map_metadata(c["emdb"], rng, k)
-    all_examples += gen_opm_membrane(c["opm"], c["entries"], rng, k)
-    all_examples += gen_alphafraud_rich_comparison(c["alphafraud"], rng, k)
-    all_examples += gen_structure_report_card(c["entries"], c["validation"], rng, k)
+    all_examples += _safe_gen(gen_xray_resolution_quality, c["entries"], rng, k)
+    all_examples += _safe_gen(gen_rfree_quality, c["entries"], rng, k)
+    all_examples += _safe_gen(gen_em_resolution_quality, c["entries"], rng, k)
+    all_examples += _safe_gen(gen_nmr_characteristics, c["entries"], rng, k)
+    all_examples += _safe_gen(gen_twilight_ligand_fit, c["twilight"], rng, k)
+    all_examples += _safe_gen(gen_unit_cell_space_group, c["entries"], rng, k)
+    all_examples += _safe_gen(gen_crystallization_conditions, c["entries"], rng, k)
+    all_examples += _safe_gen(gen_validation_geometry, c["validation"], c["entries"], rng, k)
+    all_examples += _safe_gen(gen_alphafold_vs_experimental, c["alphafold"], c["entries"], c["sifts_uniprot"], rng, k)
+    all_examples += _safe_gen(gen_multihop_structure_quality_full, c["entries"], c["validation"], rng, k)
+    all_examples += _safe_gen(gen_pdbredo_refinement_delta, c["pdbredo"], c["entries"], rng, k)
+    all_examples += _safe_gen(gen_emdb_map_metadata, c["emdb"], rng, k)
+    all_examples += _safe_gen(gen_opm_membrane, c["opm"], c["entries"], rng, k)
+    all_examples += _safe_gen(gen_alphafraud_rich_comparison, c["alphafraud"], rng, k)
+    all_examples += _safe_gen(gen_structure_report_card, c["entries"], c["validation"], rng, k)
     print("  computing FreeSASA interface areas for assembly biography (execution-verified) ...")
-    all_examples += gen_assembly_biography(c["structure_files"], c["entries"], rng, k)
+    all_examples += _safe_gen(gen_assembly_biography, c["structure_files"], c["entries"], rng, k)
 
-    # tool_calling — split across 15 generators. DSSP and NMR-model-count are execution-verified
-    # against the full 256,444-file mmCIF pool (data/structures_all/, corpus expansion round 2).
-    # Round 4 added FreeSASA/fpocket/Foldseek/US-align/PLIP/cctbx execution-verified generators,
-    # the citation-verification tool call, and the self-consistency check.
-    k = per_class // 15
+    # tool_calling — split across 28 example-scaling generators (plus 8 more with small fixed
+    # caps below, per the round-5 runtime mitigation -- MD/crystallography/docking are much slower
+    # per-call than everything else here). DSSP and NMR-model-count are execution-verified against
+    # the full 256,444-file mmCIF pool (data/structures_all/, corpus expansion round 2). Round 4
+    # added FreeSASA/fpocket/Foldseek/US-align/PLIP/cctbx execution-verified generators, the
+    # citation-verification tool call, and the self-consistency check. Round 5 added full PyMOL/
+    # ChimeraX command awareness, sequence alignment (pairwise + MAFFT), WebLogo, biotite plots,
+    # py3Dmol, pdb-tools, a topology schematic, PDB2PQR, OpenMM/GROMACS, CCP4/PHENIX
+    # crystallography, and AutoDock Vina docking.
+    k = per_class // 28
     print("Generating tool_calling ...")
-    all_examples += gen_biopython_count(c["entries"], rng, k)
-    all_examples += gen_gemmi_metadata(c["entries"], rng, k)
-    all_examples += gen_pymol_script(c["entries"], rng, k)
+    all_examples += _safe_gen(gen_biopython_count, c["entries"], rng, k)
+    all_examples += _safe_gen(gen_gemmi_metadata, c["entries"], rng, k)
+    print("  running PyMOL scripts headless (execution-verified) ...")
+    all_examples += _safe_gen(gen_pymol_script, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_pymol_command_reference, c["pymol_commands"], rng, k)
+    print("  running ChimeraX scripts headless (execution-verified) ...")
+    all_examples += _safe_gen(gen_chimerax_script, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_chimerax_command_reference, c["chimerax_commands"], rng, k)
+    print("  running pairwise alignment + MAFFT MSA (execution-verified) ...")
+    all_examples += _safe_gen(gen_pairwise_alignment, c["entries"], c["sifts_uniprot"], rng, k)
+    all_examples += _safe_gen(gen_msa_family, c["entries"], c["clusters_30"], rng, k)
+    print("  building WebLogo sequence logos (execution-verified) ...")
+    all_examples += _safe_gen(gen_sequence_logo, c["entries"], c["clusters_30"], rng, k)
+    print("  building biotite DSSP/Ramachandran/contact-map/B-factor plots (execution-verified) ...")
+    all_examples += _safe_gen(gen_dssp_plot, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_ramachandran_plot, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_contact_map, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_bfactor_plot, c["structure_files"], rng, k)
+    print("  building py3Dmol interactive views + running pdb-tools (execution-verified) ...")
+    all_examples += _safe_gen(gen_py3dmol_view, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_pdbtools_manipulation, c["structure_files"], rng, k)
+    print("  building topology schematics (execution-verified) ...")
+    all_examples += _safe_gen(gen_topology_schematic, c["structure_files"], rng, k)
+    print("  running PDB2PQR (execution-verified, slow per-call -- small fixed count) ...")
+    all_examples += _safe_gen(gen_pdb2pqr_prep, c["structure_files"], rng, min(k, 200))
+    print("  running OpenMM + GROMACS minimization pipelines (execution-verified, slow -- small fixed count) ...")
+    all_examples += _safe_gen(gen_openmm_script, c["structure_files"], c["entries"], rng, min(k, 150))
+    all_examples += _safe_gen(gen_gromacs_pipeline, c["structure_files"], c["entries"], rng, min(k, 150))
+    print("  running CCP4/PHENIX crystallography pipelines (execution-verified, slow -- small fixed counts) ...")
+    print("  building the shared real-MTZ pool once (reused by all 3 MTZ-based generators below) ...")
+    crystallography_pool = _crystallography_pool(c["structure_files"], c["entries"], rng, target_n=min(k, 150))
+    all_examples += _safe_gen(gen_mtz_manipulation, crystallography_pool, min(k, 150))
+    all_examples += _safe_gen(gen_ccp4_refmac_script, crystallography_pool, min(k, 100))
+    all_examples += _safe_gen(gen_phenix_refine_script, crystallography_pool, min(k, 40))
+    all_examples += _safe_gen(gen_phenix_molprobity, c["structure_files"], rng, min(k, 120))
+    print("  running AutoDock Vina docking (execution-verified, slow -- small fixed count) ...")
+    all_examples += _safe_gen(gen_autodock_vina_docking, c["structure_files"], c["twilight"], rng, min(k, 100))
     print("  running DSSP on real structure files (execution-verified) ...")
-    all_examples += gen_dssp_secondary_structure(c["structure_files"], rng, k)
-    all_examples += gen_nmr_model_count(c["structure_files"], c["entries"], rng, k)
+    all_examples += _safe_gen(gen_dssp_secondary_structure, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_nmr_model_count, c["structure_files"], c["entries"], rng, k)
     print("  running tool-chain (parse+DSSP) analysis scripts (execution-verified) ...")
-    all_examples += gen_tool_chain_structure_analysis(c["structure_files"], rng, k)
-    all_examples += gen_tool_chain_lookup(c["sifts_uniprot"], c["pharos"], rng, k)
+    all_examples += _safe_gen(gen_tool_chain_structure_analysis, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_tool_chain_lookup, c["sifts_uniprot"], c["pharos"], rng, k)
     print("  running FreeSASA/fpocket/Foldseek/US-align/PLIP (execution-verified) ...")
-    all_examples += gen_freesasa_interface(c["structure_files"], rng, k)
-    all_examples += gen_fpocket_druggability(c["structure_files"], rng, k)
-    all_examples += gen_foldseek_neighbors(c["structure_files"], rng, k)
-    all_examples += gen_usalign_pairwise(c["structure_files"], c["entries"], c["sifts_uniprot"], rng, k)
-    all_examples += gen_plip_interactions(c["structure_files"], rng, k)
-    all_examples += gen_geometry_recompute_disagreement(c["structure_files"], c["validation"], rng, k)
-    all_examples += gen_self_consistency_check(c["structure_files"], c["entries"], rng, k)
-    all_examples += gen_tool_verify_citation(c["entries"], rng, k)
+    all_examples += _safe_gen(gen_freesasa_interface, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_fpocket_druggability, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_foldseek_neighbors, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_usalign_pairwise, c["structure_files"], c["entries"], c["sifts_uniprot"], rng, k)
+    all_examples += _safe_gen(gen_plip_interactions, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_geometry_recompute_disagreement, c["structure_files"], c["validation"], rng, k)
+    all_examples += _safe_gen(gen_self_consistency_check, c["structure_files"], c["entries"], rng, k)
+    all_examples += _safe_gen(gen_tool_verify_citation, c["entries"], rng, k)
 
     # database_cross_referencing — split across 29 generators. Round 4 added: SCOP2 fold
     # descriptions, MobiDB disorder, sequence redundancy clusters, obsolete-entry warnings,
@@ -2634,40 +4257,40 @@ def main() -> None:
     # structural biography, and the small scoped disease-target-context chain.
     k = per_class // 29
     print("Generating database_cross_referencing ...")
-    all_examples += gen_uniprot_chain_mapping(c["sifts_uniprot"], rng, k)
-    all_examples += gen_pfam_domain(c["sifts_pfam"], rng, k)
-    all_examples += gen_cath_fold(c["cath_joined"], rng, k)
-    all_examples += gen_ec_number(c["sifts_enzyme"], rng, k)
-    all_examples += gen_uniprot_function(c["uniprot"], rng, k)
-    all_examples += gen_pharos_druggability(c["pharos"], c["sifts_uniprot"], rng, k)
-    all_examples += gen_ccd_identity(c["ccd"], rng, k)
-    all_examples += gen_citation(c["entries"], rng, k)
-    all_examples += gen_organism_taxonomy(c["entries"], rng, k)
-    all_examples += gen_binding_affinity(c["bindingdb"], rng, k)
-    all_examples += gen_string_interactors(c["string"], rng, k)
-    all_examples += gen_alphafold_confidence(c["alphafold"], rng, k)
-    all_examples += gen_uniprot_to_pdb_aggregate(c["sifts_uniprot"], rng, k)
-    all_examples += gen_ligand_to_pdb_aggregate(c["twilight"], rng, k)
-    all_examples += gen_multihop_target_context(c["entries"], c["sifts_uniprot"], c["pharos"], c["bindingdb"], rng, k)
-    all_examples += gen_multihop_ligand_quality_chain(c["twilight"], c["bindingdb"], rng, k)
-    all_examples += gen_multihop_fold_function(c["cath_joined"], c["uniprot"], rng, k)
-    all_examples += gen_cross_db_disagreement(c["entries"], c["sifts_uniprot"], c["uniprot"], rng, k)
-    all_examples += gen_missing_data_honesty(c["entries"], c["validation"], rng, k)
-    all_examples += gen_compare_two_entries(c["entries"], c["sifts_uniprot"], rng, k)
-    all_examples += gen_rag_synthesis(c["entries"], c["sifts_uniprot"], c["uniprot"], c["pharos"], c["validation"], rng, k)
-    all_examples += gen_scop2_fold_description(c["scop2"], rng, k)
-    all_examples += gen_mobidb_disorder(c["mobidb"], rng, k)
-    all_examples += gen_sequence_redundancy(c["clusters_30"], c["entries"], rng, k)
-    all_examples += gen_obsolete_entry_warning(c["obsolete"], rng, k)
-    all_examples += gen_citation_honesty(c["citations"], c["entries"], rng, k)
-    all_examples += gen_family_homolog_context(c["cath_joined"], rng, k)
-    all_examples += gen_structural_biography(c["entries"], c["sifts_uniprot"], rng, k)
-    all_examples += gen_disease_target_context(c["disease_context"], c["sifts_uniprot"], c["bindingdb"], rng, k)
+    all_examples += _safe_gen(gen_uniprot_chain_mapping, c["sifts_uniprot"], rng, k)
+    all_examples += _safe_gen(gen_pfam_domain, c["sifts_pfam"], rng, k)
+    all_examples += _safe_gen(gen_cath_fold, c["cath_joined"], rng, k)
+    all_examples += _safe_gen(gen_ec_number, c["sifts_enzyme"], rng, k)
+    all_examples += _safe_gen(gen_uniprot_function, c["uniprot"], rng, k)
+    all_examples += _safe_gen(gen_pharos_druggability, c["pharos"], c["sifts_uniprot"], rng, k)
+    all_examples += _safe_gen(gen_ccd_identity, c["ccd"], rng, k)
+    all_examples += _safe_gen(gen_citation, c["entries"], rng, k)
+    all_examples += _safe_gen(gen_organism_taxonomy, c["entries"], rng, k)
+    all_examples += _safe_gen(gen_binding_affinity, c["bindingdb"], rng, k)
+    all_examples += _safe_gen(gen_string_interactors, c["string"], rng, k)
+    all_examples += _safe_gen(gen_alphafold_confidence, c["alphafold"], rng, k)
+    all_examples += _safe_gen(gen_uniprot_to_pdb_aggregate, c["sifts_uniprot"], rng, k)
+    all_examples += _safe_gen(gen_ligand_to_pdb_aggregate, c["twilight"], rng, k)
+    all_examples += _safe_gen(gen_multihop_target_context, c["entries"], c["sifts_uniprot"], c["pharos"], c["bindingdb"], rng, k)
+    all_examples += _safe_gen(gen_multihop_ligand_quality_chain, c["twilight"], c["bindingdb"], rng, k)
+    all_examples += _safe_gen(gen_multihop_fold_function, c["cath_joined"], c["uniprot"], rng, k)
+    all_examples += _safe_gen(gen_cross_db_disagreement, c["entries"], c["sifts_uniprot"], c["uniprot"], rng, k)
+    all_examples += _safe_gen(gen_missing_data_honesty, c["entries"], c["validation"], rng, k)
+    all_examples += _safe_gen(gen_compare_two_entries, c["entries"], c["sifts_uniprot"], rng, k)
+    all_examples += _safe_gen(gen_rag_synthesis, c["entries"], c["sifts_uniprot"], c["uniprot"], c["pharos"], c["validation"], rng, k)
+    all_examples += _safe_gen(gen_scop2_fold_description, c["scop2"], rng, k)
+    all_examples += _safe_gen(gen_mobidb_disorder, c["mobidb"], rng, k)
+    all_examples += _safe_gen(gen_sequence_redundancy, c["clusters_30"], c["entries"], rng, k)
+    all_examples += _safe_gen(gen_obsolete_entry_warning, c["obsolete"], rng, k)
+    all_examples += _safe_gen(gen_citation_honesty, c["citations"], c["entries"], rng, k)
+    all_examples += _safe_gen(gen_family_homolog_context, c["cath_joined"], rng, k)
+    all_examples += _safe_gen(gen_structural_biography, c["entries"], c["sifts_uniprot"], rng, k)
+    all_examples += _safe_gen(gen_disease_target_context, c["disease_context"], c["sifts_uniprot"], c["bindingdb"], rng, k)
 
     # supplementary refusal boundary — round 4 added mutation/variant-effect framing
     print("Generating refusal_boundary ...")
-    all_examples += gen_refusal_boundary(c["uniprot"], rng, min(1000, per_class // 5))
-    all_examples += gen_mutation_refusal(c["uniprot"], rng, min(1000, per_class // 5))
+    all_examples += _safe_gen(gen_refusal_boundary, c["uniprot"], rng, min(1000, per_class // 5))
+    all_examples += _safe_gen(gen_mutation_refusal, c["uniprot"], rng, min(1000, per_class // 5))
 
     print(f"\nGenerated {len(all_examples):,} raw examples. Validating ...")
     valid_pdb_ids = set(c["entries"]["pdb_id"].str.upper())
