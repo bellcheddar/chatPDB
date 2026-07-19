@@ -1092,18 +1092,84 @@ round 6's new tools have PHENIX/GROMACS/ChimeraX-style per-call process-startup 
 much larger `alphafraud_comparisons.csv`. Full narrative, class balance, and token stats in
 `data/README.md`'s v6 entry.
 
+**Round 7 (2026-07-19): closing the robustness/edge-case gaps chem_sage's own eval work
+surfaced.** Marc asked whether chatPDB has enough edge-case/bad-example/failure-case coverage to
+make the fine-tuned model good, explicitly referencing a chem_sage learning. Reading chem_sage's
+actual `eval_chem.py`/`PROJECT_PLAN.md` (not memory) found it grew from 3 to 13 metrics after early
+rounds' models showed real failures — hallucinated numbers that didn't match tool output, no
+refusal, repetition collapse — and chem_sage responded with dedicated training generators for
+exactly those failure modes: `raft_distractor` (a correct value shown next to a wrong one, training
+explicit rejection), `refusal`, and `pyexec_drill` (code must actually execute or the example is
+rejected). Auditing chatPDB's 88 existing generators against this found solid coverage already
+(missing-data honesty, cross-db disagreement, self-consistency checks, citation honesty, obsolete-
+entry warnings, structure-prediction refusal) but three genuine gaps, each mirroring a chem_sage
+lesson directly:
+- **`gen_invalid_pdb_id_refusal`** — zero prior coverage of a nonexistent/invalid PDB ID.
+  `validate()`'s own docstring confirmed *"there is no code path that could produce an example
+  citing an ID absent from the corpus"* — every other generator samples real IDs by design, so the
+  model had never once seen "the user asked about a made-up ID, here's the honest response."
+  Live-verified the ~61% real-ID collision rate in the 4-character ID space (17/20 random samples
+  hit real entries) before writing the retry-until-confirmed-absent generation loop.
+- **`gen_distractor_value_correction`** — chatPDB's answer to `raft_distractor`. Presents a real
+  value from a *different* real entry as if it belonged to the one being asked about (resolution,
+  R-free, or clashscore), and trains the correction. Never an invented float — both the distractor
+  and the correction are real, verifiable numbers from the corpus, just deliberately misattributed.
+- **`gen_tool_failure_honesty`** — every existing `tool_calling` generator only keeps successful
+  runs, so the corpus had zero examples of a tool genuinely failing and the model saying so
+  honestly. Three real, execution-verified failure sub-cases: DSSP on nucleic-acid-only entries
+  (live-confirmed `_run_dssp_mmcif()` returns a genuine empty result for entry `101D`), selecting a
+  chain that doesn't exist in a specific real entry (PyMOL cleanly returns 0 atoms, no crash),
+  and `gemmi.write_pdb()`'s real `RuntimeError` on multi-character chain IDs in large assemblies
+  (the same failure mode that crashed round 5's first full run, reused here deliberately). All
+  three are captured by actually running the tool against real structures, not fabricated text.
+
+Design principle held throughout: deliberately-constructed "bad" examples still never fabricate —
+every wrong value is real, just misattributed; every failure is a real tool genuinely failing.
+`validate()`'s leak-detection regex (`\bnan\b`/`\bnone\b`) required care in Phase C's wording (e.g.
+"empty result" rather than "returns None" for DSSP's no-protein case).
+
+**Result: 97,272 examples** (77,818 train / 9,727 valid / 9,727 test), 2.6% rejection rate, 97% of
+the 100,000 target. Class balance: file_format_literacy 25,000 (exact), experimental_method 23,520,
+database_cross_referencing 23,221, tool_calling 22,611, refusal_boundary 3,000 (exact — up from
+round 6's 2,000, now split across 3 generators instead of 2, confirming
+`gen_invalid_pdb_id_refusal` landed at its full target share). Full clean run took ~11h24m (10:09
+start to 21:33 finish), no `_safe_gen` backstop triggers, no corpus source changes so RAG was not
+re-ingested this round.
+
 ### Phase 4 — QLoRA fine-tune with MLX-LM (0.5–1 day of compute)
 `config/train_config.yaml` seeded from chem_sage's validated field names and values (rank, RSLoRA,
 `steps_per_report == steps_per_eval` from round one — chem_sage had to learn this the hard way,
 chatPDB starts correct).
 
-`scripts/train_launch.py` ports chem_sage's memory-fraction tuning
-(`mx.set_cache_limit`/`mx.set_memory_limit` against `mx.device_info()["max_recommended_working_set_size"]`)
-and adds two things chem_sage didn't have from round one:
-- **`wandb.init()`** logging — train/val loss, tokens/sec, memory, LR schedule — from round one.
-  chatPDB is a fresh project, so there's no reason to wait the way chem_sage's own roadmap did.
-- **Checkpoint auto-resume** — scan `adapters/<name>/*_adapters.safetensors` for the highest iter
-  and offer a `--resume` flag that wires into `mlx_lm.lora`'s native `--resume-adapter-file`.
+Tooling audit (2026-07-19, live-checked against current `mlx-lm` docs and chem_sage's actual
+scripts, not memory) found the current `mlx-lm` release has moved past several things chem_sage had
+to hand-roll:
+- **`--report-to wandb`** — training-metric logging is now a native `mlx_lm.lora` flag (also
+  `--report-to swanlab`), no `wandb.init()` wrapper needed. Checking chem_sage's real
+  `train_launch.py`/`train_qlora.py` found the wrapper was only ever planned in memory, never
+  actually implemented — this closes that gap for free rather than porting dead code.
+- **`--mask-prompt`** — computes loss only on the completion turn, not the system+user prompt.
+  chem_sage never used this. Worth adopting: chatPDB's system prompt is long and shouldn't be
+  optimised against.
+- **`mx.set_wired_limit()`** (macOS 15+) — caps how much memory MLX wires so paging behaves
+  sanely instead of risking the unbounded-wired-growth kernel-panic path some `mlx-lm` users have
+  hit. More surgical than chem_sage's `preflight.sh` (kill background apps, hope), used alongside
+  it, not instead of it — `scripts/train_launch.py` should call this ahead of
+  `mx.set_cache_limit`/`mx.set_memory_limit` (chem_sage's existing memory-fraction tuning against
+  `mx.device_info()["max_recommended_working_set_size"]`, still ported as-is).
+- **`--grad-checkpoint`** / **`--grad-accumulation-steps`** — native fallbacks if 64 GB unified
+  memory isn't enough headroom at the target rank, trading compute for memory more cleanly than
+  chem_sage's only lever (reducing `--num-layers`).
+- **Sequence-length check before training** — `mlx-lm`'s own docs recommend splitting long
+  examples into smaller sequences to cut memory use; worth a token-length pass over
+  `data/sft/*.jsonl` before Phase 4 starts, since chatPDB's tool-output code blocks can run long.
+- **`asitop`/`mactop`** (third-party, `pip`/`brew` install) — live GPU/CPU/power/RAM+swap in a
+  second terminal window during the run, on top of W&B's training-loop-only view. Cheap, optional,
+  the thing that would have shown chem_sage's R5 swap thrashing as it happened rather than after.
+
+`scripts/train_launch.py` also adds **checkpoint auto-resume** (scan `adapters/<name>/*_adapters.safetensors`
+for the highest iter, offer a `--resume` flag wiring into `mlx_lm.lora`'s native
+`--resume-adapter-file`) — something chem_sage never had from round one.
 
 **Critical:** watch train/val loss together; climbing validation loss means stop early, same rule
 chem_sage lived by.

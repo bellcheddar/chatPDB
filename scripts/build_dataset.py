@@ -3156,6 +3156,259 @@ def gen_pandas_analysis(validation_df: pd.DataFrame, entries_df: pd.DataFrame,
     return out
 
 
+# ---------------------------------------------------------------------------
+# Round 7: robustness/edge-case gaps found by comparing against chem_sage's own eval lessons
+# (chem_sage added raft_distractor/refusal/pyexec_drill after early rounds' models hallucinated
+# numbers, didn't refuse appropriately, and gave up on tool calls). Three real gaps found: chatPDB
+# never trains on a nonexistent PDB ID (every other generator samples real IDs by construction),
+# never shows a wrong-but-real value to correct (no adversarial/distractor pattern), and never
+# keeps a genuine tool failure (every tool_calling generator elsewhere only keeps successes).
+# All three stay ground-truth-first: every "wrong" value is a real number from a different real
+# entry, and every "failure" is a real tool genuinely failing against a real structure, captured
+# by actually running it -- not fabricated.
+# ---------------------------------------------------------------------------
+
+def gen_invalid_pdb_id_refusal(entries_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Real-ID density in the 4-char PDB-ID space is ~61% (256,448 real entries out of ~419,904
+    possible digit+3-alphanumeric combinations, confirmed live during round-7 planning: 17/20
+    random IDs collided with real entries) -- a retry-until-confirmed-absent loop, not single-shot
+    random generation, is needed to reliably produce a genuinely nonexistent ID. Teaches the model
+    to decline honestly rather than fabricate details about an ID that was never deposited -- a
+    near-certain real-world scenario (typos, IDs hallucinated elsewhere) no other generator in this
+    file can produce, since every other generator samples IDs directly from the real corpus."""
+    import string
+    real_ids = set(entries_df["pdb_id"].str.upper())
+    question_templates = [
+        "What is the resolution of PDB entry {id}?",
+        "What experimental method was used to solve PDB entry {id}?",
+        "What chains are present in PDB entry {id}?",
+        "What ligands are bound in PDB entry {id}?",
+        "What's the primary citation for PDB entry {id}?",
+    ]
+    out = []
+    attempts = 0
+    while len(out) < n and attempts < n * 20:
+        attempts += 1
+        malformed = rng.random() < 0.25
+        if malformed:
+            kind = rng.choice(["too_short", "too_long", "bad_start"])
+            if kind == "too_short":
+                fake_id = "".join(rng.choices(string.ascii_uppercase + string.digits, k=rng.choice([2, 3])))
+            elif kind == "too_long":
+                fake_id = "".join(rng.choices(string.ascii_uppercase + string.digits, k=rng.choice([5, 6])))
+            else:
+                fake_id = rng.choice(string.ascii_uppercase) + "".join(rng.choices(string.ascii_uppercase + string.digits, k=3))
+        else:
+            fake_id = str(rng.randint(1, 9)) + "".join(rng.choices(string.ascii_uppercase + string.digits, k=3))
+        if fake_id.upper() in real_ids:
+            continue
+        q = rng.choice(question_templates).format(id=fake_id)
+        format_note = (
+            f" On top of that, `{fake_id}` doesn't even match the real PDB ID format (a digit "
+            f"followed by three alphanumeric characters, four characters total)."
+            if malformed else ""
+        )
+        a = (
+            f"`{fake_id}` isn't a real PDB entry — it doesn't appear in the wwPDB archive.{format_note} "
+            f"I won't guess at details for an ID that was never deposited. Common causes: a "
+            f"transposed character, mixing up visually similar characters (O/0, I/1), or citing a "
+            f"UniProt accession or another database's ID instead of a PDB ID. If you can tell me "
+            f"the protein or structure you're actually looking for, I can help you find the real "
+            f"entry."
+        )
+        out.append(make_example(q, a, "refusal_boundary"))
+    return out
+
+
+def gen_distractor_value_correction(entries_df: pd.DataFrame, validation_df: pd.DataFrame,
+                                     rng: random.Random, n: int) -> list[dict]:
+    """Adversarial/distractor pattern (chem_sage's raft_distractor lesson): present a real number
+    that belongs to a *different* real entry as if it were true for this one, and correct it with
+    the real value. Never an invented float -- both the distractor and the correction are real,
+    verifiable numbers from the corpus, just testing whether the model catches a misattribution
+    rather than accepting a plausible-sounding premise at face value."""
+    field_choices = [
+        ("resolution", "resolution_A", entries_df[entries_df["resolution_A"].notna()][["pdb_id", "resolution_A"]], "Å", 2),
+        ("R-free", "r_free", entries_df[entries_df["r_free"].notna()][["pdb_id", "r_free"]], "", 3),
+    ]
+    if not validation_df.empty and "clashscore" in validation_df.columns:
+        field_choices.append((
+            "clashscore", "clashscore",
+            validation_df[validation_df["clashscore"].notna()][["pdb_id", "clashscore"]], "", 2,
+        ))
+
+    out = []
+    for _ in range(n * 3):
+        if len(out) >= n:
+            break
+        field_label, col, pool, unit, decimals = rng.choice(field_choices)
+        if len(pool) < 2:
+            continue
+        rows = pool.sample(n=2, random_state=rng.randint(0, 1 << 30))
+        target, distractor_row = rows.iloc[0], rows.iloc[1]
+        target_id, distractor_id = target["pdb_id"], distractor_row["pdb_id"]
+        if target_id == distractor_id:
+            continue
+        real_val, distractor_val = float(target[col]), float(distractor_row[col])
+        if abs(real_val - distractor_val) < 10 ** (-decimals):
+            continue
+        real_str = f"{real_val:.{decimals}f}"
+        distractor_str = f"{distractor_val:.{decimals}f}"
+        q = f"I read that PDB entry {target_id}'s {field_label} is {distractor_str}{unit} — is that right?"
+        a = (
+            f"No — {target_id}'s real deposited {field_label} is {real_str}{unit}, not "
+            f"{distractor_str}{unit}. That number doesn't match this entry's actual metadata. "
+            f"({distractor_str}{unit} happens to be a real value in this corpus, just for a "
+            f"different entry — worth double-checking whether it got attached to the wrong PDB ID "
+            f"somewhere along the way, or was simply misremembered/mistyped.)"
+        )
+        out.append(make_example(q, a, "experimental_method"))
+    return out
+
+
+def gen_tool_failure_honesty(structure_files: list[Path], entries_df: pd.DataFrame,
+                              rng: random.Random, n: int) -> list[dict]:
+    """Every tool_calling generator elsewhere in this file only keeps successful runs -- correct,
+    for ground-truth-first discipline, but the side effect is the training data has never shown a
+    real tool genuinely failing. These three sub-cases fix that without breaking the discipline:
+    each is a real tool run against a real structure that genuinely fails, captured by actually
+    running it (not invented), explained honestly. Small fixed count, not scaled with the usual
+    tool_calling k -- real reproducible failures are naturally scarce, don't force-scale a rare
+    real phenomenon into an artificially large bucket."""
+    import string
+    import gemmi
+
+    na_ids = set(entries_df[(entries_df["protein_entity_count"] == 0) &
+                             (entries_df["nucleic_acid_entity_count"] > 0)]["pdb_id"].str.lower())
+    na_files = [p for p in structure_files if p.stem in na_ids]
+
+    out = []
+    kinds = ["dssp_no_protein", "nonexistent_chain", "long_chain_id"]
+    attempts = 0
+    while len(out) < n and attempts < n * 8:
+        attempts += 1
+        kind = rng.choice(kinds)
+
+        if kind == "dssp_no_protein":
+            if not na_files:
+                continue
+            path = rng.choice(na_files)
+            result = _run_dssp_mmcif(path)
+            if result is not None:
+                continue
+            pid = path.stem.upper()
+            q = f"Assign secondary structure to PDB entry {pid} (mmCIF file `{path.name}`) using DSSP."
+            a = (
+                "```python\n"
+                "from Bio.PDB import MMCIFParser\n"
+                "from Bio.PDB.DSSP import DSSP\n\n"
+                f"structure = MMCIFParser(QUIET=True).get_structure('{pid}', '{path.name}')\n"
+                f"dssp = DSSP(structure[0], '{path.name}', dssp='mkdssp', file_type='mmCIF')\n"
+                "print(list(dssp.keys()))  # empty result\n"
+                "```\n\n"
+                f"Running this against {pid}'s real deposited coordinates gives an empty result -- "
+                f"DSSP assigns secondary structure to protein backbone (phi/psi torsion geometry), "
+                f"and {pid} has no protein chain, only nucleic acid. There's no helix/strand/loop "
+                f"assignment to report for this entry; DSSP simply doesn't apply here."
+            )
+            out.append(make_example(q, a, "tool_calling"))
+
+        elif kind == "nonexistent_chain":
+            path = rng.choice(structure_files)
+            try:
+                st = gemmi.read_structure(str(path))
+                st.setup_entities()
+                real_chains = [c.name for c in st[0]]
+            except Exception:
+                continue
+            if not real_chains:
+                continue
+            candidate_letters = [c for c in string.ascii_uppercase if c not in real_chains]
+            if not candidate_letters:
+                continue
+            fake_chain = rng.choice(candidate_letters)
+            pdb_tmp = None
+            try:
+                pdb_tmp = Path(_gemmi_to_pdb(path))
+                local_pdb = pdb_tmp.with_name(f"{path.stem.lower()}.pdb")
+                local_pdb.write_bytes(pdb_tmp.read_bytes())
+                ok = _pymol_execute(
+                    f"cmd.load('{local_pdb.name}', '{path.stem.lower()}')\n"
+                    f"cmd.select('sel', 'chain {fake_chain}')\n"
+                    f"n_atoms = cmd.count_atoms('sel')\n"
+                    f"assert n_atoms == 0\n",
+                    local_pdb,
+                )
+                local_pdb.unlink(missing_ok=True)
+            except Exception:
+                ok = False
+            finally:
+                if pdb_tmp:
+                    Path(pdb_tmp).unlink(missing_ok=True)
+            if not ok:
+                continue
+            pid = path.stem.upper()
+            real_chain_list = ", ".join(real_chains)
+            q = f"Select chain {fake_chain} in PDB entry {pid} (mmCIF file `{path.name}`) and show it as cartoon."
+            a = (
+                "```python\n"
+                "from pymol import cmd\n\n"
+                f"cmd.load('{pid.lower()}.pdb', '{pid.lower()}')\n"
+                f"cmd.select('sel', 'chain {fake_chain}')\n"
+                "print('Atoms selected:', cmd.count_atoms('sel'))\n"
+                "```\n\n"
+                f"Running this against {pid}'s real deposited coordinates selects 0 atoms -- chain "
+                f"{fake_chain} doesn't exist in this entry. {pid}'s real chains are: "
+                f"{real_chain_list}. Double-check the chain ID; PyMOL won't error on a selection "
+                f"that matches nothing, it'll just silently give an empty selection back, which is "
+                f"worth checking for explicitly rather than assuming the command worked."
+            )
+            out.append(make_example(q, a, "tool_calling"))
+
+        else:  # long_chain_id
+            path = rng.choice(structure_files)
+            try:
+                st = gemmi.read_structure(str(path))
+                st.setup_entities()
+                long_chain_names = [c.name for c in st[0] if len(c.name) > 1]
+            except Exception:
+                continue
+            if not long_chain_names:
+                continue
+            tmp_path = None
+            try:
+                tmp_path = _gemmi_to_pdb(path)
+                continue  # didn't actually fail this time -- skip rather than fabricate a failure
+            except RuntimeError as e:
+                error_text = str(e)
+            except Exception:
+                continue
+            finally:
+                if tmp_path:
+                    Path(tmp_path).unlink(missing_ok=True)
+            pid = path.stem.upper()
+            chain_preview = ", ".join(long_chain_names[:5]) + ("..." if len(long_chain_names) > 5 else "")
+            q = f"Convert PDB entry {pid} (mmCIF file `{path.name}`) to legacy PDB format for a tool that requires it."
+            a = (
+                "```python\n"
+                "import gemmi\n\n"
+                f"st = gemmi.read_structure('{path.name}')\n"
+                "st.setup_entities()\n"
+                "st.write_pdb('converted.pdb')\n"
+                "```\n\n"
+                f"This raises a real error on {pid}: `{error_text}`. {pid} has at least one chain "
+                f"name longer than a single character ({chain_preview}) -- common in large "
+                f"assemblies with more than 26 chains, since the legacy PDB format only supports "
+                f"single-character chain IDs. Tools that need legacy PDB (DSSP via mkdssp, "
+                f"FreeSASA, some PyMOL scripts) won't work directly on this entry without first "
+                f"renaming chains down to single characters (losing the original naming) or "
+                f"dropping the offending chains; working from the native mmCIF file directly, "
+                f"where this limit doesn't exist, is usually the better option."
+            )
+            out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
 # --- Round 4: response-richness techniques (house format, family/homolog reasoning, biography, ---
 # --- self-consistency, mutation-refusal) -- classes vary per generator, see each make_example call
 
@@ -4568,10 +4821,12 @@ def main() -> None:
     all_examples += _safe_gen(gen_format_pdb_vs_mmcif, c["entries"][c["entries"]["atom_count"] > 20000], rng, k)
     all_examples += _safe_gen(gen_biological_assembly_asu, c["entries"], rng, k)
 
-    # experimental_method — split across 16 generators. Round 4 added PDB-REDO refinement deltas,
+    # experimental_method — split across 17 generators. Round 4 added PDB-REDO refinement deltas,
     # EMDB map metadata, OPM membrane placement, the AlphaFraud rich comparison (replacing the
     # thin round-3 pLDDT-only one), the house structure-report-card format, and assembly biography.
-    k = per_class // 16
+    # Round 7 added the distractor-value-correction generator (adversarial pattern: a real value
+    # from a different real entry, presented as if true for this one, corrected).
+    k = per_class // 17
     print("Generating experimental_method ...")
     all_examples += _safe_gen(gen_xray_resolution_quality, c["entries"], rng, k)
     all_examples += _safe_gen(gen_rfree_quality, c["entries"], rng, k)
@@ -4590,6 +4845,7 @@ def main() -> None:
     all_examples += _safe_gen(gen_structure_report_card, c["entries"], c["validation"], rng, k)
     print("  computing FreeSASA interface areas for assembly biography (execution-verified) ...")
     all_examples += _safe_gen(gen_assembly_biography, c["structure_files"], c["entries"], rng, k)
+    all_examples += _safe_gen(gen_distractor_value_correction, c["entries"], c["validation"], rng, k)
 
     # tool_calling — split across 34 example-scaling generators (plus 8 more with small fixed
     # caps below, per the round-5 runtime mitigation -- MD/crystallography/docking are much slower
@@ -4667,6 +4923,8 @@ def main() -> None:
     all_examples += _safe_gen(gen_geometry_recompute_disagreement, c["structure_files"], c["validation"], rng, k)
     all_examples += _safe_gen(gen_self_consistency_check, c["structure_files"], c["entries"], rng, k)
     all_examples += _safe_gen(gen_tool_verify_citation, c["entries"], rng, k)
+    print("  capturing genuine tool failures (DSSP-on-nucleic-acid, nonexistent chain, long chain ID) ...")
+    all_examples += _safe_gen(gen_tool_failure_honesty, c["structure_files"], c["entries"], rng, min(k, 300))
 
     # database_cross_referencing — split across 29 generators. Round 4 added: SCOP2 fold
     # descriptions, MobiDB disorder, sequence redundancy clusters, obsolete-entry warnings,
@@ -4704,10 +4962,12 @@ def main() -> None:
     all_examples += _safe_gen(gen_structural_biography, c["entries"], c["sifts_uniprot"], rng, k)
     all_examples += _safe_gen(gen_disease_target_context, c["disease_context"], c["sifts_uniprot"], c["bindingdb"], rng, k)
 
-    # supplementary refusal boundary — round 4 added mutation/variant-effect framing
+    # supplementary refusal boundary — round 4 added mutation/variant-effect framing, round 7 added
+    # invalid/nonexistent PDB ID refusal (retry-until-confirmed-absent against the real ID set).
     print("Generating refusal_boundary ...")
     all_examples += _safe_gen(gen_refusal_boundary, c["uniprot"], rng, min(1000, per_class // 5))
     all_examples += _safe_gen(gen_mutation_refusal, c["uniprot"], rng, min(1000, per_class // 5))
+    all_examples += _safe_gen(gen_invalid_pdb_id_refusal, c["entries"], rng, min(1000, per_class // 5))
 
     print(f"\nGenerated {len(all_examples):,} raw examples. Validating ...")
     valid_pdb_ids = set(c["entries"]["pdb_id"].str.upper())
