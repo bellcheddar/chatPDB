@@ -154,6 +154,12 @@ REGISTRY: list[CorpusFile] = [
     CorpusFile("chimerax_commands.csv", "command",
                ["usage"],
                subdir="chimerax", case_insensitive=False),
+    # Round 6: py3Dmol/3Dmol.js GLViewer command corpus (scraped from 3Dmol.js's own official API
+    # reference, scripts/build_py3dmol_command_corpus.py). Case-sensitive -- JS method names are
+    # camelCase and exact-match matters here.
+    CorpusFile("py3dmol_commands.csv", "method",
+               ["signature", "description"],
+               subdir="py3dmol", case_insensitive=False),
 ]
 
 _cache: dict[str, pd.DataFrame] = {}

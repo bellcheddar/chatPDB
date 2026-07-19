@@ -60,6 +60,15 @@ vina
 # PHENIX bundles its own working cctbx build (phenix.molprobity), so the standalone-cctbx
 # git-clone attempted and abandoned in round 4 is no longer needed for MolProbity validation.
 
+# --- Round 6: MDAnalysis/ProDy actually wired in (installed since round 1, unused until now), ---
+# --- bio3d/R, plotly, full py3Dmol command awareness, pandas as a taught skill ---
+# MDAnalysis and prody: already listed above (round 1) -- no new install, just newly used.
+plotly                       # interactive 2D charts (Ramachandran/contact-map/B-factor), complements py3Dmol's 3D view
+# bio3d: an R package, not pip. R itself already installed (was chem_sage-era: ggplot2/dplyr/
+# rcdk). Install with:
+#   Rscript -e 'install.packages("bio3d", repos="https://cloud.r-project.org")'
+# real prebuilt binary, no compile step. gen_bio3d_script shells out to `Rscript` directly.
+
 # --- Chat CLI ---
 rich                        # console rendering (Markdown, panels, progress, themes)
 prompt_toolkit              # interactive input with history, arrow keys, bottom toolbar

@@ -25,6 +25,27 @@ they're not useful for text-generation SFT examples and roughly triple response 
 `/api/analysis`, the cached cumulative snapshot (per-superfamily scorecards, conformational
 heterogeneity, enrichment stats).
 
+**KNOWN GAP, found round 6 (2026-07-18): `/api/week/{label}` under-serves months that got
+reprocessed across multiple backfill runs.** After the full backfill completed (32,728 screened,
+15,482 fully `compared`), this script's API-based pull only captured 6,799 of those 15,482 real
+rows -- confirmed via a direct read-only SQL query against `/opt/alphafraud/alphafraud.db` over SSH
+(`SELECT COUNT(*) FROM entities WHERE status='compared'`). The gap is concentrated in specific
+months (2019 almost entirely missing -- e.g. 2019-04 has 931 real rows, the API served 5; also
+2026-01 through 2026-03), not spread evenly, and a live re-check of `/api/week/2019-04-01` right
+now still only returns 7 total entities -- the API endpoint itself is the bottleneck, not this
+script's parsing. **If a future re-run of this script yields a suspiciously low total again (well
+under whatever AlphaFraud's own `/api/analysis` snapshot or admin tally reports), don't trust the
+API path -- pull directly from the database instead:**
+    ssh alphafraud.mdeller.com "/opt/alphafraud/.venv/bin/python3 -c \"
+    import sqlite3, csv
+    conn = sqlite3.connect('file:/opt/alphafraud/alphafraud.db?mode=ro', uri=True)
+    cur = conn.cursor()
+    fields = [...]  # see KEEP_FIELDS below
+    cur.execute(f\\\"SELECT {','.join(fields)} FROM entities WHERE status='compared'\\\")
+    ...\""
+(requires the backfill service to be `inactive`, not `active` -- SQLite refuses even read-only
+connections while the writer process holds an open transaction, confirmed live both ways.)
+
 Usage:
     python scripts/download_alphafraud.py
     python scripts/download_alphafraud.py --limit-weeks 5   # smoke test

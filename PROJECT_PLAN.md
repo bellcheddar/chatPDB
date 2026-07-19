@@ -9,20 +9,22 @@ reasons about structures that already exist, their provenance, and how to query 
 with real tools.
 
 **Author:** Marc C. Deller, D.Phil. ([marcdeller.com](https://marcdeller.com))
-**Status:** Phase 3 (SFT dataset) complete through round 5 (2026-07-18): a full visualization/
-rendering/simulation tool review — full PyMOL (436 commands) and ChimeraX (547 commands) command
-awareness via live introspection, sequence alignment (pairwise + MAFFT MSA), WebLogo sequence
-logos, biotite structural plots (DSSP track, Ramachandran, contact map, B-factor), py3Dmol
-interactive viewers, pdb-tools, a 2D topology schematic, electrostatics prep, molecular dynamics
-(OpenMM + GROMACS), crystallography (CCP4 + PHENIX, real refinement/validation against real
-deposited reflection data), and AutoDock Vina docking — 21 new execution-verified generators.
-Full narrative in §7, after the round 4 entry.
-Base model: `mlx-community/Qwen3-32B-4bit`. RAG corpus: 39 files / 102,873 chunks (up from
-37 / 102,163 — the two new command corpora, pymol_commands.csv 436 chunks + chimerax_commands.csv
-274 chunks). SFT dataset v5: 94,376 examples
-(75,502 train / 9,437 valid / 9,437 test), 2.8% rejection rate, full regeneration ran ~15h across
-two attempts (a real full-scale-only bug crashed attempt 1 three hours in; fixed, then a clean
-~11h completion — see §7's round 5 bug list and `data/README.md`'s v5 entry).
+**Status:** Phase 3 (SFT dataset) complete through round 6 (2026-07-19): round 5 was a full
+visualization/rendering/simulation tool review — full PyMOL (436 commands) and ChimeraX (547
+commands) command awareness via live introspection, sequence alignment, WebLogo, biotite plots,
+py3Dmol, pdb-tools, a 2D topology schematic, electrostatics prep, molecular dynamics (OpenMM +
+GROMACS), crystallography (CCP4 + PHENIX), and AutoDock Vina docking. Round 6 wired in MDAnalysis/
+ProDy (installed since round 1, unused until now), added bio3d/R, plotly, full py3Dmol command
+awareness (108 methods, documentation-grounded), pandas as a taught skill, and pulled in
+AlphaFraud's full backfill (gated on live confirmation the backfill service had genuinely finished,
+then a real API-completeness bug caught and fixed via direct database export). Full narrative in
+§7, after the round 4 entry.
+Base model: `mlx-community/Qwen3-32B-4bit`. RAG corpus: 40 files / 105,463 chunks (up from
+39 / 102,873 — py3dmol_commands.csv 16 chunks new, alphafraud_comparisons.csv grown from 7 to
+2,581 chunks). SFT dataset v6: 95,884 examples
+(76,708 train / 9,588 valid / 9,588 test), 2.7% rejection rate, full regeneration ran ~11h clean
+(after the AlphaFraud database-export fix — see §7's round 6 section and `data/README.md`'s v6
+entry).
 Phase 4 (QLoRA fine-tune) not yet started.
 **Fine-tune stack:** MLX-LM on Apple Silicon (committed — same choice chem_sage validated over five
 rounds; see section 3).
@@ -401,6 +403,26 @@ below for the full story):
 - **AutoDock Vina** (pip, non-trivial Boost-version install — see `requirements.txt`) + OpenBabel
   (already installed) for receptor/ligand PDBQT prep — real redocking of deposited ligands back
   into their own binding pockets.
+
+**Round 6 additions** (R/plotly/pandas audit, Marc's explicit ask — see round 6 narrative below):
+- **MDAnalysis** and **ProDy** — both installed since round 1, neither ever wired into a generator
+  until now. MDAnalysis: real per-residue RMSF across NMR ensemble models (conformational
+  variability). ProDy: real ANM (elastic network model) normal mode analysis, predicting
+  flexibility from a single structure's geometry alone.
+- **bio3d** (R package, `install.packages("bio3d", ...)`, not pip) — real R-based structural
+  analysis (parsing, atom selection, B-factor extraction, normal mode analysis) via headless
+  `Rscript`. R itself was already installed (chem_sage-era: ggplot2/dplyr/rcdk), just never used
+  for structural biology.
+- **plotly** — interactive Ramachandran/contact-map/B-factor charts, reusing round 5's exact real
+  biotite computations under a new interactive rendering backend, complementing py3Dmol's
+  interactive 3D view.
+- **py3Dmol — full command awareness**: 108 real `GLViewer` methods scraped from 3Dmol.js's own
+  official API reference (`scripts/build_py3dmol_command_corpus.py`). Unlike PyMOL/ChimeraX,
+  py3Dmol's Python API is a blind `__getattr__` proxy with no local introspection target, so this
+  tier is documentation-grounded, not execution-verified — no headless browser/JS engine exists in
+  this project to confirm a call renders correctly.
+- **pandas** — already a hard dependency used throughout corpus construction, now also taught as a
+  skill the model writes itself (`groupby`/`sort_values`/`merge` against real corpus CSVs).
 
 ---
 
@@ -1008,6 +1030,67 @@ crystallography/docking generators' PHENIX/GROMACS/ChimeraX/PyMOL per-call proce
 overhead now dominating more than fpocket's long tail alone did in round 4. `corpus_lookup.py`'s
 registry and the RAG corpus were updated with the two new command-corpus files. Full narrative,
 class balance, and token stats in `data/README.md`'s v5 entry.
+
+**Round 6 (2026-07-19): MDAnalysis/ProDy actually wired in, bio3d/R, plotly, full py3Dmol command
+awareness, pandas as a taught skill, and AlphaFraud's full backfill.** Marc asked whether R,
+plotly, and pandas were part of the tool ecosystem, and what else was obviously missing. Live audit
+found `MDAnalysis` and `ProDy` installed since round 1 but never used in a single generator; `plotly`
+and R's `bio3d` absent entirely; pandas used everywhere internally but never taught. Also asked
+whether py3Dmol got the same full-command-awareness treatment PyMOL/ChimeraX did in round 5 — it
+hadn't. Six new execution-verified generators (five execution-verified against real structures, one
+documentation-grounded):
+- `gen_mdanalysis_rmsf` — real per-residue RMSF across NMR ensemble models (conformational
+  variability, distinct from round 5's crystallographic B-factor plot).
+- `gen_prody_anm` — real Anisotropic Network Model normal mode analysis, predicting flexibility
+  from a single structure's geometry alone (elastic network, no ensemble needed).
+- `gen_bio3d_script` — real R/bio3d scripts (parsing, atom selection, B-factor extraction, normal
+  mode analysis) via headless `Rscript`, the direct answer to "do we have R."
+- `gen_plotly_view` — interactive Ramachandran/contact-map/B-factor charts, reusing round 5's
+  exact real biotite computations under a new interactive rendering backend.
+- `gen_py3dmol_command_reference` — 108 real `GLViewer` methods scraped from 3Dmol.js's own
+  official API docs (`scripts/build_py3dmol_command_corpus.py`). py3Dmol's Python API is a blind
+  `__getattr__` proxy with zero local introspection target (confirmed by reading its source), so
+  unlike PyMOL/ChimeraX this tier is explicitly documentation-grounded, not execution-verified —
+  no headless browser/JS engine exists in this project to confirm a call renders correctly.
+- `gen_pandas_analysis` — real pandas `groupby`/`sort_values`/`merge` code run against real
+  corpus CSVs, teaching the skill the model had only ever seen used internally.
+
+**AlphaFraud, gated on Marc's explicit instruction: "only start once the backfill is confirmed 100%
+complete."** Live SSH access (`ssh alphafraud.mdeller.com`) found `alphafraud-backfill.service`
+still `active`, processing 2025-08 depositions — the public `/archive` page's 90 labels spanning
+2018–2026 looked complete but wasn't. Watched the service (`systemctl is-active`, per the unit
+file's own documented behavior: clean completion leaves it `inactive`, only a crash restarts it)
+across ~13 real hours until it finished: "Full backfill done: 32,728 screened, 2,968 fully
+analysed, 4,898 skipped."
+
+**Two real, serious errors caught only by not trusting the first "done" signal** — Marc pushed back
+twice on numbers presented as final, both times correctly:
+1. My live sample during planning (raw entity counts per `/api/week/{label}`) suggested ~65,000+
+   real comparisons; the actual re-pull got 6,799. First correction: the raw counts were
+   screened+compared combined, not just `status=='compared'` (170 of 3,608 for one sampled week) —
+   a real miscounting on my part, not a bug.
+2. Marc pushed back again with AlphaFraud's own admin tally showing **15,482** "fully compared"
+   entities — still 2.3x what the corrected 6,799 pull got. This one *was* a real bug: a direct
+   read-only SQL query against `/opt/alphafraud/alphafraud.db` confirmed 15,482 real `compared`
+   rows exist, but `/api/week/{label}` itself under-serves months that got reprocessed across
+   multiple historical backfill runs (2019 almost entirely missing — e.g. 2019-04 has 931 real rows,
+   the API serves 5; also 2026-01 through 2026-03) — confirmed live that the API endpoint is the
+   bottleneck, not this project's download script. Fixed by killing the in-progress rebuild (only
+   24 minutes in — cheap to redo), exporting all 15,482 rows directly from the database over SSH
+   (bypassing the buggy endpoint entirely), and documenting the finding + the direct-SQL fallback
+   recipe in `download_alphafraud.py`'s own docstring for any future re-run.
+
+**Result: 95,884 examples** (76,708 train / 9,588 valid / 9,588 test), 2.7% rejection rate, 96% of
+the 100,000 target. Class balance: file_format_literacy 25,000 (exact), experimental_method 23,430
+(up from round 5's 21,875 — the richer AlphaFraud data let `gen_alphafraud_rich_comparison` hit
+close to its real target for the first time in the project's history), database_cross_referencing
+23,226, tool_calling 22,309, refusal_boundary 2,000 (exact). Zero `_safe_gen` backstop triggers.
+Full rebuild took ~11h (clean single run, after the AlphaFraud fix above) — meaningfully less added
+runtime than round 5 despite 6 more generators, confirming the plan's own prediction: none of
+round 6's new tools have PHENIX/GROMACS/ChimeraX-style per-call process-startup overhead.
+`corpus_lookup.py`'s registry and the RAG corpus were updated with `py3dmol_commands.csv` and the
+much larger `alphafraud_comparisons.csv`. Full narrative, class balance, and token stats in
+`data/README.md`'s v6 entry.
 
 ### Phase 4 — QLoRA fine-tune with MLX-LM (0.5–1 day of compute)
 `config/train_config.yaml` seeded from chem_sage's validated field names and values (rank, RSLoRA,

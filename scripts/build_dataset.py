@@ -103,6 +103,9 @@ def load_corpus() -> dict:
     c["pymol_commands"] = _read_optional(CORPUS / "pymol/pymol_commands.csv")
     c["chimerax_commands"] = _read_optional(CORPUS / "chimerax/chimerax_commands.csv")
 
+    # Round 6 source: py3Dmol/3Dmol.js command corpus (scripts/build_py3dmol_command_corpus.py).
+    c["py3dmol_commands"] = _read_optional(CORPUS / "py3dmol/py3dmol_commands.csv")
+
     # CATH domain -> classification join, keyed by PDB id + chain (mirrors rag/corpus_lookup.py's
     # two-hop join, precomputed here once for speed across thousands of generated examples).
     # sifts_pdb_cath.csv columns: PDB, CHAIN, SP_PRIMARY, CATH_ID (confirmed live 2026-07-15).
@@ -2752,6 +2755,407 @@ def gen_autodock_vina_docking(structure_files: list[Path], twilight_df: pd.DataF
     return out
 
 
+# ---------------------------------------------------------------------------
+# Round 6: MDAnalysis (NMR-ensemble RMSF), ProDy (ANM normal modes), bio3d/R, plotly, py3Dmol full
+# command awareness, pandas as a taught skill. MDAnalysis and ProDy have been in requirements.txt
+# since round 1 but were never actually wired into a generator until now.
+# ---------------------------------------------------------------------------
+
+def gen_mdanalysis_rmsf(structure_files: list[Path], entries_df: pd.DataFrame,
+                         rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real per-residue RMSF (root-mean-square fluctuation) across a real NMR
+    ensemble's models, via MDAnalysis. Distinct from round 5's B-factor plot (single-structure,
+    crystallographic) and from gen_nmr_model_count (just counts models) -- this measures real
+    conformational variability across the ensemble itself, only meaningful for NMR's multi-model
+    entries. mmCIF isn't a native MDAnalysis topology format -- convert via _gemmi_to_pdb first,
+    same pattern every legacy-PDB-only tool in this file already uses."""
+    import MDAnalysis as mda
+    from MDAnalysis.analysis import align, rms
+
+    nmr_ids = set(entries_df[entries_df["method"] == "SOLUTION NMR"]["pdb_id"].str.lower())
+    nmr_files = [p for p in structure_files if p.stem in nmr_ids]
+    out = []
+    candidates = rng.sample(nmr_files, k=min(n * 6, len(nmr_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        pdb_tmp = None
+        try:
+            pdb_tmp = Path(_gemmi_to_pdb(path))
+            u = mda.Universe(str(pdb_tmp))
+            if len(u.trajectory) < 3:
+                continue
+            ca = u.select_atoms("name CA and protein")
+            if ca.n_atoms < 5:
+                continue
+            avg = align.AverageStructure(u, u, select="name CA and protein", ref_frame=0).run()
+            align.AlignTraj(u, avg.results.universe, select="name CA and protein", in_memory=True).run()
+            rmsf = rms.RMSF(ca).run()
+            values = rmsf.results.rmsf
+            mean_rmsf = float(values.mean())
+            max_idx = int(values.argmax())
+            max_val = float(values[max_idx])
+            n_models = len(u.trajectory)
+        except Exception:
+            continue
+        finally:
+            if pdb_tmp:
+                pdb_tmp.unlink(missing_ok=True)
+        pid = path.stem.upper()
+        q = f"Compute per-residue RMSF across the NMR ensemble models of PDB entry {pid} (mmCIF file `{path.name}`) to find the most conformationally variable region."
+        a = (
+            "```python\n"
+            "import MDAnalysis as mda\n"
+            "from MDAnalysis.analysis import align, rms\n\n"
+            f"u = mda.Universe('{pid.lower()}.pdb')  # {n_models} real NMR models as trajectory frames\n"
+            "ca = u.select_atoms('name CA and protein')\n"
+            "avg = align.AverageStructure(u, u, select='name CA and protein', ref_frame=0).run()\n"
+            "align.AlignTraj(u, avg.results.universe, select='name CA and protein', in_memory=True).run()\n"
+            "rmsf = rms.RMSF(ca).run()\n"
+            "print(rmsf.results.rmsf)\n"
+            "```\n\n"
+            f"Across {pid}'s real {n_models}-model NMR ensemble ({ca.n_atoms} CA atoms): mean RMSF "
+            f"{mean_rmsf:.2f} Å, with the most variable residue at CA index {max_idx} (RMSF "
+            f"{max_val:.2f} Å). Since NMR restraints are typically sparser near termini and loops, a "
+            f"high RMSF there often reflects genuinely weak experimental restraint rather than "
+            f"real biological flexibility -- worth cross-checking position (terminus vs. interior "
+            f"loop) before reading too much biology into any single residue's number."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_prody_anm(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real Anisotropic Network Model (elastic network model) normal mode
+    analysis via ProDy -- predicts flexible regions from a *single* structure's geometry alone, no
+    ensemble or trajectory needed. A third, theory-derived flexibility signal alongside round 5's
+    B-factor plot (experimental) and this round's MDAnalysis RMSF (ensemble-derived)."""
+    import prody
+
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 5, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        pdb_tmp = None
+        try:
+            pdb_tmp = Path(_gemmi_to_pdb(path))
+            st = prody.parsePDB(str(pdb_tmp))
+            ca = st.select("name CA and protein")
+            if ca is None or ca.numAtoms() < 10 or ca.numAtoms() > 1200:
+                continue
+            anm = prody.ANM(path.stem)
+            anm.buildHessian(ca)
+            anm.calcModes(n_modes=20)
+            flucts = prody.calcSqFlucts(anm)
+            mean_fluct = float(flucts.mean())
+            max_idx = int(flucts.argmax())
+            max_fluct = float(flucts[max_idx])
+            n_ca = ca.numAtoms()
+        except Exception:
+            continue
+        finally:
+            if pdb_tmp:
+                pdb_tmp.unlink(missing_ok=True)
+        pid = path.stem.upper()
+        q = f"Run an ANM (elastic network model) normal mode analysis on PDB entry {pid} (mmCIF file `{path.name}`) to predict its most flexible region."
+        a = (
+            "```python\n"
+            "import prody\n\n"
+            f"st = prody.parsePDB('{pid.lower()}.pdb')\n"
+            "ca = st.select('name CA and protein')\n"
+            f"anm = prody.ANM('{pid.lower()}')\n"
+            "anm.buildHessian(ca)\n"
+            "anm.calcModes(n_modes=20)\n"
+            "flucts = prody.calcSqFlucts(anm)\n"
+            "```\n\n"
+            f"Real ANM normal mode analysis on {pid}'s deposited coordinates ({n_ca} CA atoms, 20 "
+            f"lowest-frequency modes): predicted mean squared fluctuation {mean_fluct:.3f}, peaking "
+            f"at CA index {max_idx} ({max_fluct:.3f}). This is a purely geometric/elastic-network "
+            f"prediction from the single deposited structure -- it estimates *intrinsic* "
+            f"flexibility from the fold's own topology, independent of crystallographic B-factors "
+            f"or any experimental ensemble, and the two don't always agree perfectly since they're "
+            f"measuring genuinely different things (predicted vs. observed flexibility)."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+BIO3D_SETUP = ""  # bio3d needs no env sourcing, unlike CCP4/PHENIX -- just a plain Rscript call
+
+BIO3D_TASKS: list[tuple[str, "callable"]] = [
+    ("load the structure and report its real atom/residue/chain counts", lambda pid: (
+        f"pdb <- read.pdb('{pid.lower()}.pdb')\n"
+        f"cat('Atoms:', nrow(pdb$atom), '\\n')\n"
+        f"cat('Chains:', length(unique(pdb$atom$chain)), '\\n')")),
+    ("select and count all alpha-carbon atoms", lambda pid: (
+        f"pdb <- read.pdb('{pid.lower()}.pdb')\n"
+        f"ca.inds <- atom.select(pdb, 'calpha')\n"
+        f"cat('CA atoms:', length(ca.inds$atom), '\\n')")),
+    ("select and count all protein (non-solvent, non-ligand) atoms", lambda pid: (
+        f"pdb <- read.pdb('{pid.lower()}.pdb')\n"
+        f"prot.inds <- atom.select(pdb, 'protein')\n"
+        f"cat('Protein atoms:', length(prot.inds$atom), '\\n')")),
+    ("report the mean CA B-factor", lambda pid: (
+        f"pdb <- read.pdb('{pid.lower()}.pdb')\n"
+        f"ca.inds <- atom.select(pdb, 'calpha')\n"
+        f"cat('Mean CA B-factor:', mean(pdb$atom$b[ca.inds$atom], na.rm=TRUE), '\\n')")),
+    ("run normal mode analysis and report the number of modes computed", lambda pid: (
+        f"pdb <- read.pdb('{pid.lower()}.pdb')\n"
+        f"modes <- nma(pdb)\n"
+        f"cat('Modes computed:', length(modes$L), '\\n')")),
+    ("write the protein-only atoms out to a new PDB file", lambda pid: (
+        f"pdb <- read.pdb('{pid.lower()}.pdb')\n"
+        f"prot.inds <- atom.select(pdb, 'protein')\n"
+        f"write.pdb(pdb, inds=prot.inds, file='{pid.lower()}_protein.pdb')\n"
+        f"cat('Wrote protein-only PDB\\n')")),
+]
+
+
+def _rscript_execute(r_body: str, pdb_path: Path) -> tuple[bool, str]:
+    """Actually run the R script headless via Rscript against a real structure file and return
+    (success, stdout) -- the execution-verification step every tool_calling generator in this file
+    uses, extended here to R/bio3d."""
+    rscript_bin = shutil.which("Rscript")
+    if not rscript_bin:
+        return False, ""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        local_pdb = Path(tmpdir) / pdb_path.name
+        local_pdb.write_bytes(pdb_path.read_bytes())
+        script_path = Path(tmpdir) / "script.R"
+        script_path.write_text("suppressMessages(library(bio3d))\n" + r_body + "\n")
+        try:
+            result = subprocess.run(
+                [rscript_bin, str(script_path)],
+                capture_output=True, text=True, timeout=45, cwd=tmpdir,
+            )
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+            return False, ""
+        return result.returncode == 0, result.stdout
+
+
+def gen_bio3d_script(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real bio3d (R) scripts, run headless via Rscript against real converted
+    structure files -- the direct answer to "do we have R": real R-based structural analysis
+    (parsing, atom selection, B-factor extraction, normal mode analysis), not just R being
+    installed for an unrelated project. Same task-template + execution-verification pattern as
+    round 5's PyMOL/ChimeraX generators."""
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 5, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        task_desc, code_fn = rng.choice(BIO3D_TASKS)
+        code_body = code_fn(path.stem)
+        pdb_tmp = None
+        try:
+            pdb_tmp = Path(_gemmi_to_pdb(path))
+            local_pdb = pdb_tmp.with_name(f"{path.stem.lower()}.pdb")
+            local_pdb.write_bytes(pdb_tmp.read_bytes())
+            ok, stdout = _rscript_execute(code_body, local_pdb)
+            local_pdb.unlink(missing_ok=True)
+        except Exception:
+            ok, stdout = False, ""
+        finally:
+            if pdb_tmp:
+                Path(pdb_tmp).unlink(missing_ok=True)
+        if not ok or not stdout.strip():
+            continue
+        pid = path.stem.upper()
+        q = f"Write an R script using bio3d to load PDB entry {pid} and {task_desc}."
+        a = (
+            "```r\nlibrary(bio3d)\n" + code_body + "\n```\n\n"
+            f"Run headless via `Rscript` against the real deposited coordinates for {pid}, this "
+            f"prints:\n```\n{stdout.strip()}\n```"
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_plotly_view(structure_files: list[Path], rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified: real interactive plotly charts (Ramachandran scatter, Ca-Ca contact
+    heatmap, B-factor line) from the *same real computations* round 5's biotite generators already
+    do -- a new interactive rendering backend on already-verified real data, not new science.
+    Complements py3Dmol's interactive 3D viewer with interactive 2D data plots."""
+    import biotite.structure.io.pdbx as pdbx
+    import biotite.structure as struc
+    import numpy as np
+    import plotly.graph_objects as go
+
+    chart_kinds = ["ramachandran", "contact_map", "bfactor"]
+    out = []
+    candidates = rng.sample(structure_files, k=min(n * 5, len(structure_files)))
+    for path in candidates:
+        if len(out) >= n:
+            break
+        kind = rng.choice(chart_kinds)
+        try:
+            cif = pdbx.CIFFile.read(str(path))
+            if kind == "ramachandran":
+                arr = pdbx.get_structure(cif, model=1)
+                arr = arr[struc.filter_amino_acids(arr)]
+                if len(arr) < 20:
+                    continue
+                phi, psi, _ = struc.dihedral_backbone(arr)
+                mask = ~np.isnan(phi) & ~np.isnan(psi)
+                phi_deg, psi_deg = np.degrees(phi[mask]), np.degrees(psi[mask])
+                if len(phi_deg) < 10:
+                    continue
+                fig = go.Figure(go.Scatter(x=phi_deg, y=psi_deg, mode="markers", marker=dict(size=4)))
+                fig.update_layout(xaxis_title="Phi (deg)", yaxis_title="Psi (deg)",
+                                   xaxis_range=[-180, 180], yaxis_range=[-180, 180])
+                metric = f"{len(phi_deg)} real (phi, psi) residue pairs"
+                code_extra = (
+                    "phi, psi, omega = struc.dihedral_backbone(arr)\n"
+                    "fig = go.Figure(go.Scatter(x=np.degrees(phi), y=np.degrees(psi), mode='markers'))"
+                )
+            elif kind == "contact_map":
+                arr = pdbx.get_structure(cif, model=1)
+                ca = arr[(arr.atom_name == "CA") & struc.filter_amino_acids(arr)]
+                if len(ca) < 20 or len(ca) > 1200:
+                    continue
+                dist = np.linalg.norm(ca.coord[:, None, :] - ca.coord[None, :, :], axis=-1)
+                fig = go.Figure(go.Heatmap(z=(dist < 8.0).astype(int)))
+                fig.update_layout(xaxis_title="Residue index", yaxis_title="Residue index")
+                metric = f"{len(ca)} residues, 8 Å contact threshold"
+                code_extra = (
+                    "dist = np.linalg.norm(ca.coord[:, None, :] - ca.coord[None, :, :], axis=-1)\n"
+                    "fig = go.Figure(go.Heatmap(z=(dist < 8.0).astype(int)))"
+                )
+            else:
+                arr = pdbx.get_structure(cif, model=1, extra_fields=["b_factor"])
+                ca = arr[(arr.atom_name == "CA") & struc.filter_amino_acids(arr)]
+                if len(ca) < 10:
+                    continue
+                fig = go.Figure(go.Scatter(y=ca.b_factor, mode="lines"))
+                fig.update_layout(xaxis_title="Residue index", yaxis_title="B-factor")
+                metric = f"{len(ca)} CA atoms, mean B-factor {float(ca.b_factor.mean()):.1f}"
+                code_extra = "fig = go.Figure(go.Scatter(y=ca.b_factor, mode='lines'))"
+            html = fig.to_html(include_plotlyjs=True)
+            if len(html) < 5000:
+                continue
+        except Exception:
+            continue
+        pid = path.stem.upper()
+        kind_label = {"ramachandran": "an interactive Ramachandran plot",
+                      "contact_map": "an interactive Cα-Cα contact map",
+                      "bfactor": "an interactive per-residue B-factor plot"}[kind]
+        q = f"Build {kind_label} for PDB entry {pid} (mmCIF file `{path.name}`) using plotly."
+        a = (
+            "```python\n"
+            "import biotite.structure.io.pdbx as pdbx\n"
+            "import biotite.structure as struc\n"
+            "import plotly.graph_objects as go\n\n"
+            f"cif = pdbx.CIFFile.read('{path.name}')\n"
+            "arr = pdbx.get_structure(cif, model=1)\n"
+            f"{code_extra}\n"
+            "html = fig.to_html(include_plotlyjs=True)  # self-contained, no CDN dependency\n"
+            "```\n\n"
+            f"Real computed data from {pid}'s deposited coordinates ({metric}), rendered as a real "
+            f"self-contained interactive HTML chart ({len(html):,} characters) -- hoverable/"
+            f"zoomable in a browser, unlike round 5's matplotlib static PNGs of the same "
+            f"underlying computation. Good for embedding in a report or webpage where interactivity "
+            f"matters more than print quality."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+def gen_py3dmol_command_reference(py3dmol_commands_df: pd.DataFrame, rng: random.Random, n: int) -> list[dict]:
+    """Broad py3Dmol/3Dmol.js command awareness: real GLViewer method names + real descriptions
+    from 3Dmol.js's own official API reference (https://3dmol.org/doc/GLViewer.html) -- NOT
+    execution-verified, unlike PyMOL/ChimeraX's command references. py3Dmol's Python API is a blind
+    __getattr__ proxy (any attribute name becomes a JS call string with zero validation), so there's
+    no local Python-side introspection target, and no headless browser/JS engine exists in this
+    project to confirm a call actually renders correctly in 3Dmol.js. This teaches real command
+    names and real documented behavior, honestly flagged as documentation-grounded rather than
+    execution-verified -- the same tier round 5 used for PyMOL's GUI-only commands."""
+    if py3dmol_commands_df.empty:
+        return []
+    rows = py3dmol_commands_df[
+        py3dmol_commands_df["description"].notna() & (py3dmol_commands_df["description"].str.len() > 5)
+    ]
+    rows = rows.sample(n=min(n, len(rows)), random_state=rng.randint(0, 1 << 30))
+    out = []
+    for _, r in rows.iterrows():
+        method = r["method"]
+        sig = r.get("signature", "") or "(...)"
+        desc = r["description"]
+        q = f"What does py3Dmol/3Dmol.js's `{method}` viewer method do?"
+        a = (
+            f"`view.{method}{sig}`\n\n{desc}\n\n"
+            f"(From 3Dmol.js's own official API reference for the `GLViewer` class -- py3Dmol's "
+            f"Python API is a thin proxy that turns any `view.{method}(...)` call into the "
+            f"equivalent JavaScript call, so this is real documented behavior, not paraphrased. "
+            f"Unlike PyMOL/ChimeraX command references elsewhere in this corpus, this one is "
+            f"documentation-grounded rather than execution-verified -- no headless browser/JS "
+            f"engine exists in this project to confirm a call renders correctly in practice.)"
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
+PANDAS_TASKS: list[tuple[str, "callable"]] = [
+    ("worst clashscore", "clashscore", False),
+    ("worst Ramachandran outlier percentage", "percent_rama_outliers", False),
+    ("worst rotamer outlier percentage", "percent_rota_outliers", False),
+]
+
+
+def gen_pandas_analysis(validation_df: pd.DataFrame, entries_df: pd.DataFrame,
+                         rng: random.Random, n: int) -> list[dict]:
+    """Execution-verified (computed live, not templated): real pandas code -- groupby/sort_values/
+    merge/describe -- run against a real corpus CSV already on disk, teaching the model to write
+    pandas itself rather than only ever seeing pandas used internally to build the corpus (which is
+    what every prior round did)."""
+    if validation_df.empty:
+        return []
+    merged = validation_df.merge(entries_df[["pdb_id", "method", "resolution_A"]], on="pdb_id", how="inner")
+    out = []
+    metric_label, metric_col, _ = None, None, None
+    for _ in range(n * 3):
+        if len(out) >= n:
+            break
+        metric_label, metric_col, _ = rng.choice(PANDAS_TASKS)
+        df = merged[merged[metric_col].notna() & merged["resolution_A"].notna()]
+        sample_size = rng.randint(15, 40)
+        if len(df) < sample_size:
+            continue
+        subset = df.sample(n=sample_size, random_state=rng.randint(0, 1 << 30))
+        try:
+            sorted_subset = subset.sort_values(metric_col, ascending=False)
+            worst = sorted_subset.iloc[0]
+            mean_val = float(subset[metric_col].mean())
+            by_method = subset.groupby("method")[metric_col].mean()
+        except Exception:
+            continue
+        ids = ", ".join(subset["pdb_id"].tolist())
+        q = (
+            f"I have real wwPDB validation data for {sample_size} PDB entries ({ids}). Using "
+            f"pandas, find which one has the {metric_label} and compare the group means by "
+            f"experimental method."
+        )
+        by_method_str = ", ".join(f"{m}: {v:.2f}" for m, v in by_method.items())
+        a = (
+            "```python\n"
+            "import pandas as pd\n\n"
+            "df = pd.DataFrame(rows)  # real wwPDB validation rows, one per entry\n"
+            f"worst = df.sort_values('{metric_col}', ascending=False).iloc[0]\n"
+            f"by_method = df.groupby('method')['{metric_col}'].mean()\n"
+            "print(worst['pdb_id'], worst['" + metric_col + "'])\n"
+            "print(by_method)\n"
+            "```\n\n"
+            f"Running this against the real {sample_size}-entry sample: {worst['pdb_id']} has the "
+            f"{metric_label} at {worst[metric_col]:.2f}. Sample mean {mean_val:.2f}. "
+            f"By experimental method: {by_method_str}. `groupby` is the right tool here rather "
+            f"than manual loops whenever you're comparing a metric across a categorical field like "
+            f"experimental method -- pandas handles the aggregation and keeps the real per-group "
+            f"structure visible instead of collapsing straight to one number."
+        )
+        out.append(make_example(q, a, "tool_calling"))
+    return out
+
+
 # --- Round 4: response-richness techniques (house format, family/homolog reasoning, biography, ---
 # --- self-consistency, mutation-refusal) -- classes vary per generator, see each make_example call
 
@@ -4187,7 +4591,7 @@ def main() -> None:
     print("  computing FreeSASA interface areas for assembly biography (execution-verified) ...")
     all_examples += _safe_gen(gen_assembly_biography, c["structure_files"], c["entries"], rng, k)
 
-    # tool_calling — split across 28 example-scaling generators (plus 8 more with small fixed
+    # tool_calling — split across 34 example-scaling generators (plus 8 more with small fixed
     # caps below, per the round-5 runtime mitigation -- MD/crystallography/docking are much slower
     # per-call than everything else here). DSSP and NMR-model-count are execution-verified against
     # the full 256,444-file mmCIF pool (data/structures_all/, corpus expansion round 2). Round 4
@@ -4195,8 +4599,11 @@ def main() -> None:
     # citation-verification tool call, and the self-consistency check. Round 5 added full PyMOL/
     # ChimeraX command awareness, sequence alignment (pairwise + MAFFT), WebLogo, biotite plots,
     # py3Dmol, pdb-tools, a topology schematic, PDB2PQR, OpenMM/GROMACS, CCP4/PHENIX
-    # crystallography, and AutoDock Vina docking.
-    k = per_class // 28
+    # crystallography, and AutoDock Vina docking. Round 6 added MDAnalysis (NMR-ensemble RMSF),
+    # ProDy (ANM normal modes), bio3d/R, plotly, full py3Dmol command awareness, and pandas as a
+    # taught skill -- all fast (no PHENIX/GROMACS/ChimeraX-style per-call startup), so all 6 scale
+    # with k rather than needing a small fixed cap.
+    k = per_class // 34
     print("Generating tool_calling ...")
     all_examples += _safe_gen(gen_biopython_count, c["entries"], rng, k)
     all_examples += _safe_gen(gen_gemmi_metadata, c["entries"], rng, k)
@@ -4235,6 +4642,16 @@ def main() -> None:
     all_examples += _safe_gen(gen_phenix_molprobity, c["structure_files"], rng, min(k, 120))
     print("  running AutoDock Vina docking (execution-verified, slow -- small fixed count) ...")
     all_examples += _safe_gen(gen_autodock_vina_docking, c["structure_files"], c["twilight"], rng, min(k, 100))
+    print("  running MDAnalysis RMSF + ProDy ANM (execution-verified) ...")
+    all_examples += _safe_gen(gen_mdanalysis_rmsf, c["structure_files"], c["entries"], rng, k)
+    all_examples += _safe_gen(gen_prody_anm, c["structure_files"], rng, k)
+    print("  running bio3d (R) scripts headless (execution-verified) ...")
+    all_examples += _safe_gen(gen_bio3d_script, c["structure_files"], rng, k)
+    print("  building plotly interactive charts (execution-verified) ...")
+    all_examples += _safe_gen(gen_plotly_view, c["structure_files"], rng, k)
+    all_examples += _safe_gen(gen_py3dmol_command_reference, c["py3dmol_commands"], rng, k)
+    print("  running pandas analysis (execution-verified) ...")
+    all_examples += _safe_gen(gen_pandas_analysis, c["validation"], c["entries"], rng, k)
     print("  running DSSP on real structure files (execution-verified) ...")
     all_examples += _safe_gen(gen_dssp_secondary_structure, c["structure_files"], rng, k)
     all_examples += _safe_gen(gen_nmr_model_count, c["structure_files"], c["entries"], rng, k)
