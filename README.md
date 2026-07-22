@@ -67,29 +67,26 @@ See **[`PROJECT_PLAN.md`](PROJECT_PLAN.md)** for the full step-by-step build (ph
 | 5 | Fuse + serve | `python scripts/merge_export.py` → `mlx_lm.server --port 8080` |
 | 6 | Close the hybrid loop | `rag/tool_exec.py` (Biopython sandbox; gemmi/DSSP/PyMOL staged next) |
 | 7 | Structural evaluation | `python eval/eval_pdb.py` · `python eval/compare/eval_compare.py` |
-| 8 | Local CLI + RAG | `scripts/chat.py` |
+| 8 | Local CLI + RAG | `python scripts/chat.py` |
 
 ## ▶️ How to run
 
-**Terminal 1 — start the model server:**
-```bash
-cd /Users/dellboy/Documents/Vibe_Coding/chatPDB
-source .venv/bin/activate
-python scripts/preflight.sh   # flush memory, check for background-process contention
-mlx_lm.server --model models/chatpdb_32b_v1 --port 8080
-```
-
-**Terminal 2 — run chat (once Phase 8 ships):**
+**Interactive chat** (loads the model in-process — no server needed, unlike the eval scripts below):
 ```bash
 cd /Users/dellboy/Documents/Vibe_Coding/chatPDB
 source .venv/bin/activate
 python scripts/chat.py --model models/chatpdb_32b_v1
 ```
+`/help` for slash commands, `/info` for session details, `quit`/`exit`/`q` to leave. `--no-rag` runs
+model-only (no retrieval).
 
-Wait for "HTTP server listening" in Terminal 1 before starting Terminal 2.
-
-**Evaluate the model** (Terminal 1's server running, or let `eval_compare.py` manage its own):
+**Evaluate the model** (these two DO need `mlx_lm.server`; `eval_compare.py` manages its own):
 ```bash
+# Terminal 1
+python scripts/preflight.sh   # flush memory, check for background-process contention
+mlx_lm.server --model models/chatpdb_32b_v1 --port 8080
+
+# Terminal 2, once Terminal 1 shows "HTTP server listening"
 python eval/eval_pdb.py --n 200                 # single-model scorecard, needs Terminal 1 running
 python eval/compare/eval_compare.py              # multi-round comparison, starts its own server
 ```

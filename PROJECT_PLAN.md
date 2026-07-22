@@ -1405,6 +1405,40 @@ theme (doesn't need to reuse chem_sage's navy/`#467FF7` — pick something disti
 **Exit test:** single Python entry point (`python scripts/chat.py`) launches the full CLI experience —
 banner, model load with spinners, RAG-grounded chat, tool-call execution — end to end.
 
+**Shipped, real-verified (2026-07-22):** `scripts/chat.py`, ported from chem_sage's real
+`scripts/chat.py` (in-process `mlx_lm.load`/`stream_generate`, not the HTTP server the eval scripts
+use). Two real, chatPDB-specific corrections found during the port, both load-bearing:
+
+1. **`enable_thinking=False` must be passed directly into `tokenizer.apply_chat_template()`** —
+   confirmed via `models/chatpdb_32b_v1/chat_template.jinja`'s own `{%- if enable_thinking is
+   defined and enable_thinking is false %}` check and Phase 1's original finding (Qwen3 burns its
+   token budget on `<think>` otherwise). chem_sage's Qwen2.5-based chat.py has no equivalent.
+2. **Retrieved context is injected into the user turn, not the system message.** Checked
+   `scripts/build_dataset.py`'s own RAG-shaped-synthesis generator (the one place chatPDB's real
+   training data uses retrieved context) and found it always appends a `"Retrieved context:\n..."`
+   block to the user turn, never the system message — the system message is the exact unmodified
+   `config/system_prompt.txt` text in 100% of the 97,272 training examples. chem_sage's
+   `_build_system(context)` (context → system message) doesn't match chatPDB's own training shape,
+   so chat.py's `_build_user_turn()` follows the real pattern instead.
+
+Also simplified relative to chem_sage's source: chatPDB's `rag/corpus_lookup.lookup()` returns a
+single formatted string (built for exact-ID point lookups, Phase 2), not chem_sage's
+DataFrame-backed result objects (built for bulk-enumeration browsing) — so chat.py's corpus
+fast-path prints the string directly in a panel rather than porting chem_sage's ~250-line
+interactive paginated-table/CSV-export UI, which has no underlying data structure to browse on
+chatPDB's side. Dropped chem_sage's personal easter-egg regex (not chatPDB's to carry).
+
+Live-verified end to end via a piped-input smoke test against the real model: banner/load/corpus
+stats render correctly; the corpus fast-path correctly bypassed the LLM for a real PDB ID query
+(5AWT) and printed the real corpus row data; RAG retrieval correctly triggered for a non-ID query
+(5 chunks retrieved) and streamed a real generation with **no `<think>` tags anywhere in the
+output**, confirming the `enable_thinking=False` fix actually took effect; `/info`, `/help`,
+`/history`, and `/retry` all ran cleanly (`/retry` produced a genuinely different regeneration,
+confirming it re-runs rather than caches). One real cosmetic bug found and fixed during this
+verification: `/help`'s `"[n]"` in `/history [n]` silently vanished because rich markup parses
+`[n]` as an (unknown) tag — fixed by escaping it (`\\[n]`). Confirmed no lingering process or swap
+pressure after the in-process 32B load exits (`vm.swapusage` clean, no orphaned `chat.py` process).
+
 ### Phase 9 — Hosted demo (new phase, per Marc's hosting decision)
 `scripts/merge_export.py --de-quantize` produces standard HF-format fp16 safetensors (MLX is
 Apple-only; de-quantized fuse output is portable, ordinary `transformers`-loadable weights). Deploy
