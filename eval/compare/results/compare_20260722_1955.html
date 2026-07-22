@@ -1,0 +1,66 @@
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>chatPDB Comparative Eval — 2026-07-22 19:55</title>
+        <style>
+          :root { --navy: #1C244B; --accent: #467FF7; --bg: #f5f7fb; --text: #1a1a2e; --card: #fff; --border: #e4e8f0; }
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text);
+                  padding: 2.5rem 2rem; max-width: 1200px; margin: auto; }
+          h1 { color: var(--navy); font-size: 1.7rem; margin-bottom: .25rem; }
+          h2 { color: var(--navy); font-size: 1.1rem; margin: 2rem 0 .8rem; }
+          .sub { color: #666; font-size: .82rem; margin-bottom: 2rem; }
+          table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 12px;
+                    overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,.06); margin-bottom: 1.5rem; font-size: .8rem; }
+          th { background: var(--navy); color: #fff; text-align: left; padding: .6rem .9rem; font-size: .78rem; }
+          td { padding: .5rem .9rem; border-bottom: 1px solid var(--border); }
+          td.num { text-align: center; }
+          td.num small { color: #999; }
+          tr:last-child td { border-bottom: none; }
+          .card { background: var(--card); border-radius: 12px; padding: 1rem 1.4rem;
+                    box-shadow: 0 2px 10px rgba(0,0,0,.06); margin-bottom: 1.5rem; }
+          .footer { margin-top: 2rem; font-size: .72rem; color: #aaa; border-top: 1px solid var(--border); padding-top: 1rem; }
+          a { color: var(--accent); text-decoration: none; }
+        </style>
+        </head>
+        <body>
+
+        <h1>chatPDB Comparative Evaluation</h1>
+        <div class="sub">Generated 2026-07-22 19:55 &nbsp;·&nbsp; 100 examples/model (seed=42)</div>
+
+        <h2>Metrics</h2>
+        <table>
+          <thead><tr><th>Metric</th><th>Round 1 (32B v1)</th></tr></thead>
+          <tbody><tr><td>PDB ID Validity</td><td class='num'>100%<br><small>11/11</small></td></tr>
+<tr><td>Cross-Reference Accuracy</td><td class='num'>n/a<br><small>0/0</small></td></tr>
+<tr><td>Tool Executability</td><td class='num'>n/a<br><small>0/0</small></td></tr>
+<tr><td>Numerical Fidelity</td><td class='num'>40%<br><small>2/5</small></td></tr>
+<tr><td>Refusal Accuracy</td><td class='num'>100%<br><small>1/1</small></td></tr>
+<tr><td>Degeneration-Free</td><td class='num'>100%<br><small>10/10</small></td></tr>
+</tbody>
+        </table>
+
+        <h2>Val loss</h2>
+        <div class="card"><div style="height:380px; width:100%;">                        <script>window.PlotlyConfig = {MathJaxConfig: 'local'};</script>
+        <script charset="utf-8" src="https://cdn.plot.ly/plotly-3.7.0.min.js" integrity="sha256-jvTGqxNp8AGWEcvNLVuKr+8j5dGe9Yw51LQkmDH+IYA=" crossorigin="anonymous"></script>                <div id="75600204-05a7-4188-bd58-45001221c1e9" class="plotly-graph-div" style="height:100%; width:100%;"></div>            <script>                window.PLOTLYENV=window.PLOTLYENV || {};                                if (document.getElementById("75600204-05a7-4188-bd58-45001221c1e9")) {                    Plotly.newPlot(                        "75600204-05a7-4188-bd58-45001221c1e9",                        [{"line":{"color":"#467FF7"},"mode":"lines","name":"Round 1 (32B v1)","x":[1,10,20,30,40,50,60,70,80,90,100,110,120,130,140,150,160,170,180,190,200,210,220,230,240,250,260,270,280,290,300,310,320,330,340,350,360,370,380,390,400,410,420,430,440,450,460,470,480,490,500,510,520,530,540,550,560,570,580,590,600,601,610,620,630,640,650,660,670,680,690,700,710,720,730,740,750,760,770,780,790,800],"y":[2.46,1.703,1.245,1.094,0.533,0.459,0.416,0.541,0.613,0.538,0.332,0.317,0.274,0.283,0.173,0.512,0.226,0.177,0.223,0.15,0.184,0.241,0.248,0.244,0.137,0.245,0.119,0.195,0.187,0.12,0.327,0.221,0.191,0.262,0.321,0.25,0.378,0.179,0.217,0.146,0.313,0.229,0.287,0.336,0.233,0.174,0.226,0.276,0.19,0.196,0.293,0.315,0.209,0.105,0.236,0.16,0.219,0.265,0.285,0.23,0.176,0.137,0.18,0.204,0.302,0.158,0.262,0.261,0.333,0.292,0.446,0.396,0.358,0.397,0.353,0.187,0.568,0.262,0.194,0.334,0.178,0.211],"type":"scatter"}],                        {"template":{"data":{"barpolar":[{"marker":{"line":{"color":"white","width":0.5},"pattern":{"fillmode":"overlay","size":10,"solidity":0.2}},"type":"barpolar"}],"bar":[{"error_x":{"color":"#2a3f5f"},"error_y":{"color":"#2a3f5f"},"marker":{"line":{"color":"white","width":0.5},"pattern":{"fillmode":"overlay","size":10,"solidity":0.2}},"type":"bar"}],"carpet":[{"aaxis":{"endlinecolor":"#2a3f5f","gridcolor":"#C8D4E3","linecolor":"#C8D4E3","minorgridcolor":"#C8D4E3","startlinecolor":"#2a3f5f"},"baxis":{"endlinecolor":"#2a3f5f","gridcolor":"#C8D4E3","linecolor":"#C8D4E3","minorgridcolor":"#C8D4E3","startlinecolor":"#2a3f5f"},"type":"carpet"}],"choropleth":[{"colorbar":{"outlinewidth":0,"ticks":""},"type":"choropleth"}],"contourcarpet":[{"colorbar":{"outlinewidth":0,"ticks":""},"type":"contourcarpet"}],"contour":[{"colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]],"type":"contour"}],"heatmap":[{"colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]],"type":"heatmap"}],"histogram2dcontour":[{"colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]],"type":"histogram2dcontour"}],"histogram2d":[{"colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]],"type":"histogram2d"}],"histogram":[{"marker":{"pattern":{"fillmode":"overlay","size":10,"solidity":0.2}},"type":"histogram"}],"mesh3d":[{"colorbar":{"outlinewidth":0,"ticks":""},"type":"mesh3d"}],"parcoords":[{"line":{"colorbar":{"outlinewidth":0,"ticks":""}},"type":"parcoords"}],"pie":[{"automargin":true,"type":"pie"}],"scatter3d":[{"line":{"colorbar":{"outlinewidth":0,"ticks":""}},"marker":{"colorbar":{"outlinewidth":0,"ticks":""}},"type":"scatter3d"}],"scattercarpet":[{"marker":{"colorbar":{"outlinewidth":0,"ticks":""}},"type":"scattercarpet"}],"scattergeo":[{"marker":{"colorbar":{"outlinewidth":0,"ticks":""}},"type":"scattergeo"}],"scattergl":[{"marker":{"colorbar":{"outlinewidth":0,"ticks":""}},"type":"scattergl"}],"scattermapbox":[{"marker":{"colorbar":{"outlinewidth":0,"ticks":""}},"type":"scattermapbox"}],"scattermap":[{"marker":{"colorbar":{"outlinewidth":0,"ticks":""}},"type":"scattermap"}],"scatterpolargl":[{"marker":{"colorbar":{"outlinewidth":0,"ticks":""}},"type":"scatterpolargl"}],"scatterpolar":[{"marker":{"colorbar":{"outlinewidth":0,"ticks":""}},"type":"scatterpolar"}],"scatter":[{"fillpattern":{"fillmode":"overlay","size":10,"solidity":0.2},"type":"scatter"}],"scatterternary":[{"marker":{"colorbar":{"outlinewidth":0,"ticks":""}},"type":"scatterternary"}],"surface":[{"colorbar":{"outlinewidth":0,"ticks":""},"colorscale":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]],"type":"surface"}],"table":[{"cells":{"fill":{"color":"#EBF0F8"},"line":{"color":"white"}},"header":{"fill":{"color":"#C8D4E3"},"line":{"color":"white"}},"type":"table"}]},"layout":{"annotationdefaults":{"arrowcolor":"#2a3f5f","arrowhead":0,"arrowwidth":1},"autotypenumbers":"strict","coloraxis":{"colorbar":{"outlinewidth":0,"ticks":""}},"colorscale":{"diverging":[[0,"#8e0152"],[0.1,"#c51b7d"],[0.2,"#de77ae"],[0.3,"#f1b6da"],[0.4,"#fde0ef"],[0.5,"#f7f7f7"],[0.6,"#e6f5d0"],[0.7,"#b8e186"],[0.8,"#7fbc41"],[0.9,"#4d9221"],[1,"#276419"]],"sequential":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]],"sequentialminus":[[0.0,"#0d0887"],[0.1111111111111111,"#46039f"],[0.2222222222222222,"#7201a8"],[0.3333333333333333,"#9c179e"],[0.4444444444444444,"#bd3786"],[0.5555555555555556,"#d8576b"],[0.6666666666666666,"#ed7953"],[0.7777777777777778,"#fb9f3a"],[0.8888888888888888,"#fdca26"],[1.0,"#f0f921"]]},"colorway":["#636efa","#EF553B","#00cc96","#ab63fa","#FFA15A","#19d3f3","#FF6692","#B6E880","#FF97FF","#FECB52"],"font":{"color":"#2a3f5f"},"geo":{"bgcolor":"white","lakecolor":"white","landcolor":"white","showlakes":true,"showland":true,"subunitcolor":"#C8D4E3"},"hoverlabel":{"align":"left"},"hovermode":"closest","mapbox":{"style":"light"},"paper_bgcolor":"white","plot_bgcolor":"white","polar":{"angularaxis":{"gridcolor":"#EBF0F8","linecolor":"#EBF0F8","ticks":""},"bgcolor":"white","radialaxis":{"gridcolor":"#EBF0F8","linecolor":"#EBF0F8","ticks":""}},"scene":{"xaxis":{"backgroundcolor":"white","gridcolor":"#DFE8F3","gridwidth":2,"linecolor":"#EBF0F8","showbackground":true,"ticks":"","zerolinecolor":"#EBF0F8"},"yaxis":{"backgroundcolor":"white","gridcolor":"#DFE8F3","gridwidth":2,"linecolor":"#EBF0F8","showbackground":true,"ticks":"","zerolinecolor":"#EBF0F8"},"zaxis":{"backgroundcolor":"white","gridcolor":"#DFE8F3","gridwidth":2,"linecolor":"#EBF0F8","showbackground":true,"ticks":"","zerolinecolor":"#EBF0F8"}},"shapedefaults":{"line":{"color":"#2a3f5f"}},"ternary":{"aaxis":{"gridcolor":"#DFE8F3","linecolor":"#A2B1C6","ticks":""},"baxis":{"gridcolor":"#DFE8F3","linecolor":"#A2B1C6","ticks":""},"bgcolor":"white","caxis":{"gridcolor":"#DFE8F3","linecolor":"#A2B1C6","ticks":""}},"title":{"x":0.05},"xaxis":{"automargin":true,"gridcolor":"#EBF0F8","linecolor":"#EBF0F8","ticks":"","title":{"standoff":15},"zerolinecolor":"#EBF0F8","zerolinewidth":2},"yaxis":{"automargin":true,"gridcolor":"#EBF0F8","linecolor":"#EBF0F8","ticks":"","title":{"standoff":15},"zerolinecolor":"#EBF0F8","zerolinewidth":2}}},"margin":{"l":50,"r":20,"t":20,"b":40},"legend":{"orientation":"h","yanchor":"bottom","y":1.02},"xaxis":{"title":{"text":"Iteration"}},"yaxis":{"title":{"text":"Val Loss"}},"height":380},                        {"responsive": true}                    )                };            </script>        </div></div>
+
+        <h2>Eval runtime stats</h2>
+        <table>
+          <thead><tr><th></th><th>Round 1 (32B v1)</th></tr></thead>
+          <tbody><tr><td>Mean latency (s)</td><td class='num'>13.0</td></tr>
+<tr><td>Throughput (words/s)</td><td class='num'>5.7</td></tr>
+<tr><td>Eval time (min)</td><td class='num'>2.2</td></tr>
+<tr><td>Server CPU mean %</td><td class='num'>31.9</td></tr>
+<tr><td>Server RSS peak GB</td><td class='num'>17.63</td></tr>
+</tbody>
+        </table>
+
+        <div class="footer">
+          Generated by chatPDB comparative eval harness &nbsp;·&nbsp;
+          <a href="https://marcdeller.com">Marc C. Deller, D.Phil.</a> &nbsp;·&nbsp;
+          <a href="mailto:marc@marcdeller.com">marc@marcdeller.com</a>
+        </div>
+        </body>
+        </html>

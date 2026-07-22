@@ -66,7 +66,7 @@ See **[`PROJECT_PLAN.md`](PROJECT_PLAN.md)** for the full step-by-step build (ph
 | 4 | QLoRA fine-tune | `python scripts/train_launch.py --config config/train_config.yaml` |
 | 5 | Fuse + serve | `python scripts/merge_export.py` → `mlx_lm.server --port 8080` |
 | 6 | Close the hybrid loop | `rag/tool_exec.py` (Biopython sandbox; gemmi/DSSP/PyMOL staged next) |
-| 7 | Structural evaluation | `eval/eval_pdb.py` |
+| 7 | Structural evaluation | `python eval/eval_pdb.py` · `python eval/compare/eval_compare.py` |
 | 8 | Local CLI + RAG | `scripts/chat.py` |
 
 ## ▶️ How to run
@@ -88,6 +88,12 @@ python scripts/chat.py --model models/chatpdb_32b_v1
 
 Wait for "HTTP server listening" in Terminal 1 before starting Terminal 2.
 
+**Evaluate the model** (Terminal 1's server running, or let `eval_compare.py` manage its own):
+```bash
+python eval/eval_pdb.py --n 200                 # single-model scorecard, needs Terminal 1 running
+python eval/compare/eval_compare.py              # multi-round comparison, starts its own server
+```
+
 ## 🎓 Training
 
 Real numbers only, recorded per round — extend this table (never edit a previous round's row) as
@@ -107,6 +113,28 @@ new training rounds ship.
 
 Full narrative for every round, including every real bug found and fixed along the way, lives in
 [`PROJECT_PLAN.md`](PROJECT_PLAN.md).
+
+## 📊 Evaluation
+
+`eval/eval_pdb.py` (single-model harness) and `eval/compare/eval_compare.py` (multi-round
+comparison — auto-managed `mlx_lm.server`, `ResourceMonitor`, `--resume`, HTML + Markdown reports)
+score every response against **real, corpus-grounded ground truth** — PDB ID validity checks real
+corpus membership (not just format), cross-reference accuracy checks real SIFTS UniProt/CATH/EC
+mappings, numerical fidelity checks real resolution/R-free/chain counts, tool executability runs
+real Biopython blocks in the Phase 6 sandbox. No metric relies on hand-authored ground truth.
+
+| Metric | Round 1 (32B v1) smoke-test sample |
+|---|---|
+| PDB ID validity | 89–100% (`--n 20` / `--limit 10` runs) |
+| Cross-reference accuracy | 50% |
+| Tool executability | n/a in the 10-example sample (0/1 in the 20-example sample — the one attempt was a DSSP block, correctly excluded as not-yet-enabled per Phase 6, not a failure) |
+| Numerical fidelity | 33–40% |
+| Refusal accuracy | 100% |
+| Degeneration-free | 100% |
+
+These are small smoke-test samples (`--n 20`/`--limit 10`), run to verify the harness end to end —
+not a full evaluation pass. Run `python eval/eval_pdb.py --n 200` for a real-sized, seeded sample
+once a model server is up (see **How to run** below).
 
 ## 📚 Corpus
 

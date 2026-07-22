@@ -1,0 +1,143 @@
+# ============================================================
+# chatPDB comparative eval — model registry
+# ============================================================
+# All paths are relative to the chatPDB project root.
+# Val loss curves are [true_iter, val_loss] pairs, pulled directly from the real W&B history
+# (project "chatpdb", runs 390dnfgb + wpv76v0y) and combined using the true-iter offset
+# convention documented in PROJECT_PLAN.md / feedback_iter_offset (resumed run's own step counter
+# restarts from 1 -> true_iter = step + 600, the iter of the checkpoint it resumed from).
+#
+# Starts with a single entry (chatPDB has shipped one round so far) — add a new `- id: ...` block
+# per future round, matching the top-level README's append-only Models/Training table convention.
+# ============================================================
+
+settings:
+  n_examples: 100
+  test_file: data/sft/test.jsonl
+  port: 8080
+  sample_seed: 42
+  baseline: chatpdb_32b_v1
+  server_startup_timeout: 600   # seconds to wait for model to load (32B needs 3-5 min)
+  query_timeout: 120
+
+# ─── model definitions ────────────────────────────────────────
+
+models:
+  - id: chatpdb_32b_v1
+    display_name: "Round 1 (32B v1)"
+    subtitle: "First fine-tune · Qwen3-32B-4bit"
+    path: models/chatpdb_32b_v1
+    color: "#467FF7"
+    is_baseline: true
+    # Architecture
+    base_model: "Qwen3-32B-4bit"
+    lora_type: "RSLoRA"
+    lora_rank: 32
+    lora_scale: 64.0
+    adapted_layers: 32
+    total_layers: 64
+    # Training (real values from config/train_config.yaml + real W&B history)
+    batch_size: 4
+    learning_rate: "2.0e-5"
+    lr_schedule: "cosine_decay + 100-step warmup"
+    seed: 51
+    iters_configured: 1420
+    iters_actual: 800
+    iters_note: "early stop (Marc: 'stop the run') — real val-loss plateau since ~iter 300; crashed once at true iter ~630, resumed from the true-iter-600 checkpoint (weights-only resume, see feedback_iter_offset)"
+    best_val_loss: 0.176
+    best_val_iter: 600
+    fused_checkpoint_iter: 600
+    final_train_loss: 0.281
+    training_examples: 77818
+    peak_memory_gb: 27.9
+    fused_size_gb: 18.4
+    training_date: "2026-07-20 to 2026-07-22"
+    training_duration: "~42h wall-clock across 2 real runs (crash + resume, not all spent training)"
+    corpus_chunks: 105463
+    corpus_note: "42 source files, ChromaDB + BAAI/bge-base-en-v1.5"
+    # Val loss curve — real, from W&B project "chatpdb" (run 390dnfgb: true_iter 1-620;
+    # run wpv76v0y: step 1-200 + 600 offset = true_iter 601-800)
+    val_loss_curve:
+      - [1, 2.460]
+      - [10, 1.703]
+      - [20, 1.245]
+      - [30, 1.094]
+      - [40, 0.533]
+      - [50, 0.459]
+      - [60, 0.416]
+      - [70, 0.541]
+      - [80, 0.613]
+      - [90, 0.538]
+      - [100, 0.332]
+      - [110, 0.317]
+      - [120, 0.274]
+      - [130, 0.283]
+      - [140, 0.173]
+      - [150, 0.512]
+      - [160, 0.226]
+      - [170, 0.177]
+      - [180, 0.223]
+      - [190, 0.150]
+      - [200, 0.184]
+      - [210, 0.241]
+      - [220, 0.248]
+      - [230, 0.244]
+      - [240, 0.137]
+      - [250, 0.245]
+      - [260, 0.119]
+      - [270, 0.195]
+      - [280, 0.187]
+      - [290, 0.120]
+      - [300, 0.327]
+      - [310, 0.221]
+      - [320, 0.191]
+      - [330, 0.262]
+      - [340, 0.321]
+      - [350, 0.250]
+      - [360, 0.378]
+      - [370, 0.179]
+      - [380, 0.217]
+      - [390, 0.146]
+      - [400, 0.313]
+      - [410, 0.229]
+      - [420, 0.287]
+      - [430, 0.336]
+      - [440, 0.233]
+      - [450, 0.174]
+      - [460, 0.226]
+      - [470, 0.276]
+      - [480, 0.190]
+      - [490, 0.196]
+      - [500, 0.293]
+      - [510, 0.315]
+      - [520, 0.209]
+      - [530, 0.105]
+      - [540, 0.236]
+      - [550, 0.160]
+      - [560, 0.219]
+      - [570, 0.265]
+      - [580, 0.285]
+      - [590, 0.230]
+      - [600, 0.176]
+      - [601, 0.137]
+      - [610, 0.180]
+      - [620, 0.204]
+      - [630, 0.302]
+      - [640, 0.158]
+      - [650, 0.262]
+      - [660, 0.261]
+      - [670, 0.333]
+      - [680, 0.292]
+      - [690, 0.446]
+      - [700, 0.396]
+      - [710, 0.358]
+      - [720, 0.397]
+      - [730, 0.353]
+      - [740, 0.187]
+      - [750, 0.568]
+      - [760, 0.262]
+      - [770, 0.194]
+      - [780, 0.334]
+      - [790, 0.178]
+      - [800, 0.211]
+    val_loss_curve_note: "from W&B project 'chatpdb' (runs 390dnfgb + wpv76v0y, true-iter offset applied)"

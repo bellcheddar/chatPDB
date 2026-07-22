@@ -1359,7 +1359,37 @@ is Phase 8's scope, not this phase's — `rag/tool_exec.py` alone is what Phase 
 
 `eval/compare/eval_compare.py` ports the multi-round comparison pattern wholesale: auto-managed
 `mlx_lm.server` per model, `ResourceMonitor` (psutil CPU/RSS sampling), `--resume` on cached results,
-HTML + Markdown reports with hand-rolled SVG loss curves.
+HTML + Markdown reports with a Plotly val-loss curve (chem_sage's actual default — its own
+`_loss_curve_svg()` turned out to be dead-code fallback-only, not the live default the earlier plan
+text above implied).
+
+**Shipped, real-verified:** `eval/metrics.py` (shared metric logic — unlike chem_sage, which keeps
+two diverging copies across its two eval files), `eval/eval_pdb.py`, `eval/compare/eval_compare.py`
++ `models.yaml`, `eval/compare/eval_rescore.py` (re-scores cached results without re-querying the
+model). Two real upgrades over chem_sage's own precedent: **PDB ID validity now checks real corpus
+membership** (chem_sage's own `pdb_id_validity` is format-only regex, never real membership — chatPDB
+already has the full ID set loaded via `load_corpus()`, so use it), and **cross-reference accuracy is
+new** (chem_sage has no equivalent — checks stated PDB↔UniProt/CATH/EC mappings against the real
+SIFTS tables). Numerical fidelity checks stated resolution/R-free/chain-instance-counts against
+`pdb_entries_enriched.csv` directly (a real, grounded ground truth) rather than requiring a live
+recompute inside the metric itself.
+
+Live-verified end to end against the real `models/chatpdb_32b_v1` server (`--n 20` / `--limit 10`
+smoke tests, 2026-07-22): PDB ID validity 89–100%, cross-reference accuracy 50%, refusal accuracy
+100%, degeneration-free 100%, numerical fidelity 33–40%. One real bug found and fixed during this
+verification: `tool_executability` was penalising a model-emitted DSSP block (`DSSP(...,
+dssp='mkdssp')`) as a failure — DSSP is explicitly staged "not yet enabled" per Phase 6's own
+`rag/tool_exec.py::execute()`, but the metric function was calling `run_sandboxed()` directly and
+skipping that not-yet-enabled filter. Fixed by reusing `_not_yet_enabled_reason()` the same way
+`execute()` does. Also found: this installed `mlx_lm.server` (0.31.3) requires the request's
+`"model"` field to exactly match the server's resolved absolute model path, not an arbitrary display
+name (returns a 404 "Repository Not Found" HF-hub-resolution error otherwise) — `eval_pdb.py`'s
+`--model` default now resolves to the real absolute path; `eval_compare.py` already did this
+correctly via its per-model `model_path` construction.
+
+A full `--n 200` `eval_pdb.py` pass (real numbers, not just the smoke-test sample above) is the
+natural next step whenever the model is evaluated for real — not run as part of this build pass,
+since it's a genuine multi-hour-scale live-inference commitment against a 32B model.
 
 ### Phase 8 — Local CLI + RAG (0.5–1 day)
 `scripts/chat.py` ports chem_sage's proven skeleton: `rich` themed console, `prompt_toolkit` session
