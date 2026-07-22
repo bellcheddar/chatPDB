@@ -1,12 +1,140 @@
-# chatPDB
+# 🧬 chatPDB
 
-**Placeholder.** This repository is in the planning/scaffolding stage — see `PROJECT_PLAN.md` for
-the full build brief.
+> **A protein-structure-literate AI assistant for the Protein Data Bank: RAG for facts, a QLoRA-tuned model for behaviour, and live Biopython/gemmi/DSSP/PyMOL tool calls for structural truth. Fine-tuned and served locally on Apple Silicon with MLX-LM.**
 
-A real README, generated with the `marcs-vibe-coding` skill (house template + Elementor HTML forge),
-will replace this file once Phase 2 (RAG pipeline) or later has shipped something worth documenting.
-Until then, refer to `PROJECT_PLAN.md`.
+![MLX-LM](https://img.shields.io/badge/MLX--LM-Apple%20Silicon-000000?logo=apple&logoColor=white) ![fine-tune](https://img.shields.io/badge/fine--tune-QLoRA-467FF7) ![base](https://img.shields.io/badge/base-Qwen3--32B-00897B) ![RAG](https://img.shields.io/badge/RAG-ChromaDB%20+%2042%20sources-9b51e0) ![models](https://img.shields.io/badge/models-Hugging%20Face-FFD21E?logo=huggingface&logoColor=black) ![author](https://img.shields.io/badge/author-Marc%20C.%20Deller%2C%20D.Phil.-1C244B)
+
+<table>
+<tr>
+<td>🌐 <b>Website</b></td><td><a href="https://marcdeller.com" target="_blank" rel="noopener noreferrer">marcdeller.com</a></td>
+<td>✉️ <b>Contact</b></td><td><a href="mailto:marc@marcdeller.com">marc@marcdeller.com</a></td>
+<td>🐙 <b>GitHub</b></td><td><a href="https://github.com/bellcheddar/chatPDB" target="_blank" rel="noopener noreferrer">bellcheddar/chatPDB</a></td>
+</tr>
+</table>
 
 ---
 
-*Marc C. Deller, D.Phil. · [marcdeller.com](https://marcdeller.com) · marc@marcdeller.com*
+chatPDB is a locally hosted, open-source assistant that reasons about protein structures (file
+formats, experimental methods, cross-reference databases, structure-manipulation tools), drives
+the structural-biology tools a working structural biologist actually uses (Biopython, gemmi, DSSP,
+PyMOL, ChimeraX, and more), and grounds every factual claim in the real wwPDB/RCSB/SIFTS/UniProt
+corpus rather than memory.
+
+**Why it matters:** off-the-shelf models invent structural facts (wrong resolutions, hallucinated
+PDB IDs, fabricated secondary-structure content) and have no way to compute a real value rather
+than guess one. chatPDB fixes both by separating concerns: volatile knowledge lives in retrieval,
+stable behaviour lives in the fine-tuned weights, and deterministic structural facts (atom counts,
+secondary structure, chain composition, geometry) are computed live by real tools, executed in a
+sandbox, rather than asserted from memory. It is useful for: interrogating deposited PDB structures
+and their cross-references, generating correct Biopython/gemmi/DSSP/PyMOL scripts, honestly
+declining to answer when an ID doesn't exist or a value isn't known, and reasoning like a
+structural biologist about experimental method, quality, and biological assembly rather than
+treating a structure as a bare coordinate file.
+
+Sibling project to [ChemSage](https://github.com/bellcheddar/ChemSage), reusing its proven
+MLX-LM/QLoRA/RAG process on a fresh domain: protein structures instead of small-molecule chemistry.
+
+**Project links:**
+
+- [GitHub](https://github.com/bellcheddar/chatPDB)
+- [Models on Hugging Face](https://huggingface.co/Dellboy)
+
+## 🤗 Models on HuggingFace Hub
+
+| Model | HuggingFace | Base | SFT dataset | Round |
+|---|---|---|---|---|
+| **chatPDB 32B v1** ⭐ | [**Dellboy/chatpdb_32b_v1**](https://huggingface.co/Dellboy/chatpdb_32b_v1) | Qwen3-32B-4bit | v7 (97,272 examples) | **Round 1 (current)** |
+
+Add a row here for every future fused model (never overwrite a previous row) — see
+[🎓 Training](#-training) below for how each round's real numbers get recorded.
+
+## ⚙️ The hybrid in one line
+
+RAG keeps it truthful today; the fine-tune makes it consistent tomorrow; Biopython/gemmi/DSSP/PyMOL
+make it correct always.
+
+## 🚀 Quick start
+
+See **[`PROJECT_PLAN.md`](PROJECT_PLAN.md)** for the full step-by-step build (phases 0 to 10). Short version:
+
+| Step | What | Script / command |
+|---|---|---|
+| 0 | Env: MLX-LM + Biopython + structural tools | (`requirements.txt`) |
+| 1 | Base model (Qwen3-32B, MLX 4-bit) | `config/train_config.yaml` |
+| 2 | **RAG first** (ship this alone) | `scripts/ingest_rag.py` |
+| 3 | Build + validate SFT dataset | `scripts/build_dataset.py` |
+| 4 | QLoRA fine-tune | `python scripts/train_launch.py --config config/train_config.yaml` |
+| 5 | Fuse + serve | `python scripts/merge_export.py` → `mlx_lm.server --port 8080` |
+| 6 | Close the hybrid loop | `rag/tool_exec.py` (Biopython sandbox; gemmi/DSSP/PyMOL staged next) |
+| 7 | Structural evaluation | `eval/eval_pdb.py` |
+| 8 | Local CLI + RAG | `scripts/chat.py` |
+
+## ▶️ How to run
+
+**Terminal 1 — start the model server:**
+```bash
+cd /Users/dellboy/Documents/Vibe_Coding/chatPDB
+source .venv/bin/activate
+python scripts/preflight.sh   # flush memory, check for background-process contention
+mlx_lm.server --model models/chatpdb_32b_v1 --port 8080
+```
+
+**Terminal 2 — run chat (once Phase 8 ships):**
+```bash
+cd /Users/dellboy/Documents/Vibe_Coding/chatPDB
+source .venv/bin/activate
+python scripts/chat.py --model models/chatpdb_32b_v1
+```
+
+Wait for "HTTP server listening" in Terminal 1 before starting Terminal 2.
+
+## 🎓 Training
+
+Real numbers only, recorded per round — extend this table (never edit a previous round's row) as
+new training rounds ship.
+
+| | Round 1 (32B v1) |
+|---|---|
+| Base model | mlx-community/Qwen3-32B-4bit |
+| SFT dataset | v7 — 97,272 examples (77,818 train / 9,727 valid / 9,727 test) |
+| LoRA config | rank 32, scale 64, RSLoRA, num_layers 32/64, dropout 0.05 |
+| max_seq_length | 1,536 (real-measured: covers 100% of train.jsonl, p99.9=1,190, max=1,973) |
+| Iterations trained | ~803 of a planned 1,420 (stopped early — see below) |
+| Best checkpoint | true iter 600, val_loss 0.176 |
+| Stop reason | real val-loss plateau: block-averaged val loss stopped improving from ~iter 300 onward (0.202 best-block avg at iters 200-300, no further downward trend through iter 800) — not overfitting, just diminishing returns on the remaining budget |
+| RAG corpus | 42 source files, 105,463 indexed chunks (ChromaDB + BAAI/bge-base-en-v1.5) |
+| Real incidents this round | crashed mid-run at true iter ~630, resumed from the true-iter-600 checkpoint (weights-only resume — iteration counter and LR schedule do not carry over, see `PROJECT_PLAN.md`); a real `mlx_lm` bug (val-loss/train-loss step misalignment) found and patched locally |
+
+Full narrative for every round, including every real bug found and fixed along the way, lives in
+[`PROJECT_PLAN.md`](PROJECT_PLAN.md).
+
+## 📚 Corpus
+
+wwPDB/RCSB structures and metadata, SIFTS UniProt/Pfam/CATH/GO/EC/InterPro mappings, TWILIGHT
+ligand-fit scores, PDB-REDO refinement deltas, EMDB map metadata, OPM membrane placement, MobiDB
+disorder predictions, SCOP2 fold classification, sequence-redundancy clusters, obsolete-entry
+records, BindingDB affinities, STRING interactions, Pharos druggability, AlphaFold predictions,
+AlphaFraud PDB-vs-AlphaFold disagreement data, PubMed/CrossRef citation verification, and full
+PyMOL/ChimeraX/py3Dmol command references — see [`data/README.md`](data/README.md) for the
+complete dataset-version history and construction rules.
+
+## 🧱 Stack
+
+MLX-LM (QLoRA fine-tuning + serving), Biopython/gemmi/DSSP/PyMOL/ChimeraX/MDAnalysis/ProDy (tool
+calls), ChromaDB + BAAI/bge-base-en-v1.5 (RAG retrieval), pandas/plotly/bio3d (analysis tools
+taught to the model), Weights & Biases (training observability).
+
+---
+
+## 👤 Author
+
+**Marc C. Deller, D.Phil.**
+Structural biologist & drug discovery scientist
+
+<table>
+<tr>
+<td>🌐</td><td><a href="https://marcdeller.com" target="_blank" rel="noopener noreferrer">marcdeller.com</a></td>
+<td>✉️</td><td><a href="mailto:marc@marcdeller.com">marc@marcdeller.com</a></td>
+<td>🐙</td><td><a href="https://github.com/bellcheddar/chatPDB" target="_blank" rel="noopener noreferrer">github.com/bellcheddar/chatPDB</a></td>
+</tr>
+</table>

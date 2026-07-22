@@ -1174,12 +1174,178 @@ for the highest iter, offer a `--resume` flag wiring into `mlx_lm.lora`'s native
 **Critical:** watch train/val loss together; climbing validation loss means stop early, same rule
 chem_sage lived by.
 
+**Phase 4 launch (2026-07-20): built, calibrated, found a real corruption bug, launched.**
+Built `config/train_config.yaml`, `scripts/train_launch.py`, `scripts/preflight.sh`/`postflight.sh`,
+`scripts/check_token_lengths.py`. Real measurements, not assumptions, drove the config:
+- Confirmed machine is an **M1 Max, 32 GPU cores, 64 GB** (same tier chem_sage used) via
+  `system_profiler` — Marc's "64GB Mac M1" shorthand undersold it.
+- Real token-length pass against the actual Qwen3 tokenizer over the full 77,818-example
+  `train.jsonl`: p50=581, p99=860, p99.9=1190, max=1973. `max_seq_length: 2048` (later tightened
+  to 1536, see below) covers effectively all real data.
+- Started conservative on LoRA config: **rank=32, scale=64** (chem_sage's R4-validated baseline,
+  not their more-tuned R5 rank=64/scale=90) — chatPDB's first round, no tuning history yet to
+  justify the more aggressive config on a different model and ~5x larger dataset.
+- First clean calibration (20 iters): **77.00 s/iter**, peak memory 27.9 GB against a 46.7 GB
+  limit — looked like ~18 GB of free headroom.
+
+**A genuine bug, not just a disappointing result:** tried stacking three speed levers
+(`grad_checkpoint: false`, `max_seq_length: 1536`, `batch_size: 8→4`) based on that headroom.
+The combined run produced garbage: learning-rate values like `6.3e+32` (a value that's purely a
+function of iteration number and should never vary like that), tokens/sec in the tens of millions
+and sometimes negative, one loss value of `-4.04e+30`, and peak memory climbing to **209.76 GB** —
+over 3x the physical machine — without crashing. Isolated each lever individually against the known-
+good baseline to find the cause:
+- `grad_checkpoint: false` alone reproduced the exact same corruption (peak mem to 104 GB, real
+  swap usage). **MLX/Metal on this hardware/mlx-lm version does not fail cleanly when real memory
+  usage exceeds the recommended working set with checkpointing off — it silently corrupts
+  computation instead of erroring.** `grad_checkpoint: true` is load-bearing at this rank/layer
+  count on this machine, not just cheap insurance; the "~18 GB of headroom" estimate from peak-
+  memory-at-checkpointed was not a safe signal for how much margin exists with checkpointing
+  removed. Reverted, kept `true`.
+- `max_seq_length: 1536` alone was clean (same loss trajectory, same 27.9 GB peak, 76.03 s/iter —
+  no measurable difference from baseline in this sample, since most real batches are far shorter
+  than either cap). Kept — safe, free, marginal benefit in the long tail.
+- `batch_size: 8` alone was also clean (peak mem only 37.1 GB) but gave **no net wall-clock
+  benefit** — per-iter time roughly doubled (162.38 s/iter) to match the doubled batch, i.e. the
+  same total compute in fewer, bigger steps. Reverted to 4.
+
+Net result: none of the three speed tricks delivered a real win once properly isolated — the
+validated rate stayed at ~76–77 s/iter. Reaching 30% epoch coverage at that rate would need
+~5,834 iters (~124h / ~5.2 days). Presented the real trade-off to Marc, who chose **1420 iters
+(~30h)**, matching chem_sage's own largest single-round precedent (R5) rather than chasing epoch
+coverage on a dataset 5x the size — covers ~7.3% of one epoch (~5,680 of 77,818 examples), a
+deliberately scoped first round to get a real checkpoint to evaluate before committing further.
+
+W&B wasn't logged in on this machine; `wandb login` needs an interactive prompt that doesn't work
+over a non-TTY shell, so Marc ran `wandb login <key>` himself (the key-argument form, W&B's
+supported non-interactive path) via the `!` prefix. Verified working with a real 5-iter calibration
+run before committing to the full launch — real run appeared at `wandb.ai/dellboy-none/chatpdb`.
+
+**First launch 2026-07-20 17:41 — killed and restarted at 20:10 after a real cost miscalculation.**
+The first launch used `steps_per_report: steps_per_eval: 50` (naively copied from chem_sage's
+"align reporting" convention — a lesson about keeping a results *table* readable, not about live-
+monitoring cost). Every calibration run had used `--val-batches 0` to isolate pure training-step
+timing, so the ~30h estimate never accounted for real validation cost. Once running for real,
+`Iter 1: Val loss 2.544, Val took 2128.993s` (35.5 min for `val_batches: 50`) revealed the actual
+cost: ~30 eval events across the run × 35.5 min ≈ **17.7h of validation alone**, on top of ~30.4h
+of real training — a real total of ~48h, not the ~30h Marc had approved. Caught only because Marc
+asked "what would the best step size be" after noticing no loss curves in W&B (itself just the
+sparse `steps_per_report=50` cadence working as configured, not a bug — but the question surfaced
+the deeper cost error underneath it).
+
+Reworked the reporting/eval split: `steps_per_report: 1` (train-loss reporting is ~free — printing
+a number already computed during the normal step — no reason to hold it back), `steps_per_eval: 10`
+/ `val_batches: 5` (measured 42.58s/val-batch; ~143 eval events × ~3.55 min ≈ 8.5h validation, real
+total ~38.9h — Marc chose tighter early-stopping resolution over minimising wall-clock further).
+Killed the first run (PID 47198/47201, ~2.5h in, before any real training-loss data point had even
+logged) and relaunched clean from iteration 0 rather than resume, since the sunk cost was small and
+a mid-run reporting-cadence change isn't cleanly resumable.
+
+**Relaunched 2026-07-20 20:10**, log at `/tmp/chatpdb_train_v1.log`, W&B run
+`wandb.ai/dellboy-none/chatpdb/runs/8bnvprdf`. Final config: rank=32/scale=64, num_layers=32,
+max_seq_length=1536, mask_prompt=true, grad_checkpoint=true, batch_size=4, iters=1420,
+steps_per_report=1, steps_per_eval=10, val_batches=5, save_every=100 (~14 checkpoints across the
+run — resume-safety margin for an unattended run, see `feedback_iter_offset` on R3's battery-
+interruption lesson). Expected completion ~2026-07-22 ~11:00 (~38.9h from relaunch).
+
+**Two more mid-run incidents, 2026-07-21/22:**
+- **A real bug in `mlx_lm` itself, fixed locally.** `trainer.py`'s val-loss dict logged
+  `"iteration": it - 1` while the train-loss dict logged `"iteration": it` — with
+  `steps_per_report=1`, val's off-by-one always collided with the *previous* iteration's already-
+  logged W&B step, so `val_loss` showed as real in only ~1-in-10 rows and `NaN` elsewhere,
+  preventing W&B from rendering a clean curve. Patched the installed
+  `mlx_lm/tuner/trainer.py` (`it - 1` → `it`), killed and relaunched clean from iteration 0 a
+  second time (W&B run `390dnfgb`) — confirmed fixed via the W&B API directly (train_loss and
+  val_loss now share the same step). Also traced a recurring multi-hour CPU-starvation pattern
+  (Spotlight's daemon family: `corespotlightd`/`spotlightknowledged`/`mediaanalysisd`/
+  `duetexpertd`) to chatPDB's own 256,444-file `data/structures_all/` corpus (chem_sage's much
+  smaller corpus, 79 files, never triggered this) — full detail in `feedback_preflight`.
+- **Machine crashed at true iter ~630** (last checkpoint: iter 600, 22:20 UTC+1). Resumed via
+  `mlx_lm.lora --resume-adapter-file` — confirmed this only reloads weights, not the iteration
+  counter/optimizer state/LR schedule position (`Iter 1: Val loss 0.137` correctly matched the
+  real iter-600 model, but `Learning Rate` logged as `0.000e+00`, schedule restarted from warmup)
+  — the exact same limitation that bit chem_sage's own R3 resume (`feedback_iter_offset`).
+  Following chem_sage's precedent rather than fighting the tool: killed the first (wrongly-
+  configured, `iters` still 1420) resume attempt immediately, set `iters: 820` (remaining budget:
+  1420 − 600) so total real work still matches the original 1420, relaunched clean (W&B run
+  `wpv76v0y`). **Logged iter N in this final segment of the run = true iter (N + 600)** — apply
+  this offset in the final results table below.
+
+**Stopped early at true iter ~803 (2026-07-22 17:09), by Marc's explicit call after reviewing the
+real val-loss trend.** Pulled the full history from both W&B runs (390dnfgb pre-crash,
+wpv76v0y post-crash) rather than relying on individual noisy points, and computed block averages
+across ~100-true-iter windows:
+
+| True iter range | Avg val loss |
+|---|---|
+| 1-100 | 1.14 |
+| 100-200 | 0.265 |
+| 200-300 | **0.202** (best block) |
+| 300-400 | 0.218 |
+| 400-500 | 0.243 |
+| 500-600 | 0.222 |
+| 600-700 | 0.273 |
+| 700-800 | 0.304 |
+
+Real, substantial improvement happened in the first ~200-300 iterations; from roughly true iter 300
+onward, val loss was flat-to-noisy in the 0.2-0.3 range for ~500 further iterations (35% of the
+budget) with no further downward trend — a genuine plateau, not overfitting (no sustained climb
+either). Continuing to the originally-planned true iter 1420 was judged unlikely to meaningfully
+improve the model for the remaining ~10-12h of compute. **Best available checkpoint by val loss:
+true iter 600 (val=0.176)** — the single best individual point (0.105 at true iter 530) has no
+saved checkpoint at that exact iteration, since `save_every=100` only saves at multiples of 100.
+
+**Final checkpoint inventory** (`adapters/chatpdb_32b_v1_lora/`, renamed to `true_iter_NNNN_
+adapters.safetensors` after the run to eliminate ambiguity from the post-crash counter restart —
+the raw `0000100`/`0000200` filenames briefly held true iters 700/800 due to the resumed run's own
+counter colliding with the original filenames, see the crash-recovery note above):
+
+| True iter | Val loss | File |
+|---|---|---|
+| 100 | 0.332 | **lost** — overwritten before the precrash backup was made |
+| 200 | 0.184 | `true_iter_0000200_adapters.safetensors` |
+| 300 | 0.327 | `true_iter_0000300_adapters.safetensors` |
+| 400 | 0.313 | `true_iter_0000400_adapters.safetensors` |
+| 500 | 0.293 | `true_iter_0000500_adapters.safetensors` |
+| **600** | **0.176 (best available)** | `true_iter_0000600_adapters.safetensors` |
+| 700 | 0.396 | `true_iter_0000700_adapters.safetensors` |
+| 800 (final) | 0.211 | `true_iter_0000800_adapters.safetensors` / `adapters.safetensors` |
+
+Recommend fusing from `true_iter_0000600_adapters.safetensors` (best available val loss) rather
+than the final checkpoint, for Phase 5.
+
 ### Phase 5 — Fuse and serve (0.5 day)
 Route A, same as chem_sage: `mlx_lm.fuse` → `mlx_lm.server --port 8080`, OpenAI-compatible endpoint.
 
 ### Phase 6 — Close the hybrid loop (0.5 day)
 Wire `rag/tool_exec.py`: Biopython sandbox first (restricted subprocess, no filesystem/network), add
 gemmi/DSSP once stable, PyMOL last — the same staged-caution order chem_sage applied to RDKit→PyMOL.
+
+**Done, 2026-07-22.** Directly motivated by a real gap Phase 5 testing found: `mlx_lm.generate`
+alone emits structurally-correct real tool-call code, but nothing executes it at raw-generation
+time, so the model's own stated summary numbers can be flatly wrong even when the code is right
+(confirmed live: asked the fused model to DSSP-summarise entry 4RE2, it emitted correct Biopython/
+DSSP code but claimed "14 helical residues, 1 strand" — the real computed result is H=183, E=71 out
+of 482 residues). `rag/tool_exec.py` is the fix: detects `python` code blocks in a model response,
+copies only the specific real structure file(s) the code references (by name, out of
+`data/structures_all/`) into an isolated temp directory, and actually runs the block there, so the
+assistant can be grounded in the real computed value rather than the raw completion's guess.
+
+Ported chem_sage's real `tool_exec.py` (static import/network/filesystem blocklist, clean env,
+20s timeout, isolated per-run temp dir) and adapted the two real differences: (1) chatPDB's blocks
+reference real structure files by relative filename (`'4re2.cif'`), which chem_sage's pure-SMILES
+RDKit blocks never needed — added a `.cif`-filename scanner that copies matching real files in
+before execution, and blocked bare `open()` so the only file-read path is through the file that was
+explicitly copied in, not an arbitrary read elsewhere; (2) staged to Biopython only for this first
+pass (matching chem_sage's own RDKit→PyMOL caution) — gemmi/DSSP/PyMOL/ChimeraX blocks are detected
+and explicitly flagged as not-yet-enabled rather than silently skipped or (worse) trusted, so a
+DSSP-summarising response like the one above is now clearly marked "run manually" instead of
+silently accepted. Verified live: a real Biopython block (chain/atom count) executes and returns
+the correct real numbers; the real hallucinated-DSSP block from the Phase 5 test is correctly
+flagged, not executed; a network-access block is correctly blocked.
+
+The full `chat.py` interactive CLI (streaming generation + `tool_exec` output panel wired together)
+is Phase 8's scope, not this phase's — `rag/tool_exec.py` alone is what Phase 6 asked for.
 
 ### Phase 7 — Evaluation (1 day, then ongoing)
 `eval/eval_pdb.py`, metrics analogous to chem_sage's `eval_chem.py`:

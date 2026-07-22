@@ -1,0 +1,149 @@
+# chatPDB v1 QLoRA — Qwen3-32B-4bit (MLX-LM, M1 Max 64 GB)
+#
+# Run with: python scripts/train_launch.py --config config/train_config.yaml
+# Or:       mlx_lm.lora --config config/train_config.yaml --train
+#
+# Seeded from chem_sage's real, validated config/train_config_r5.yaml, with values changed where
+# chatPDB's own live measurements justify it (see PROJECT_PLAN.md Phase 4 for the full audit):
+#
+#   rank 64->32 / scale 90->32*2=64 (chem_sage R4 baseline, not R5's tuned config)
+#     This is chatPDB's first training round -- no prior tuning history exists to justify jumping
+#     straight to chem_sage's most-aggressive, most-tuned R5 config on a different model and a
+#     ~5x-larger, differently-balanced dataset. Effective RSLoRA alpha = 64/sqrt(32) ~= 11.3,
+#     matching chem_sage's own alpha-preserving convention when they scaled rank.
+#
+#   max_seq_length 3072->2048
+#     Real-measured against the actual Qwen3 tokenizer over the full 77,818-example train.jsonl:
+#     p50=581, p99=860, p99.9=1190, max=1973 tokens. Zero examples exceed 2048 -- no truncation
+#     risk, and no need for chem_sage's R5 value (their code_then_quote examples ran much longer).
+#
+#   mask_prompt: new adoption. chatPDB's system prompt is long; loss should only be computed on
+#     the completion, not the system+user prompt. chem_sage never used this (added to mlx-lm after
+#     their rounds shipped).
+#
+#   iters: left as a placeholder below. Real value is set after the --calibrate pass measures
+#     actual s/iter on this machine (Phase 4 implementation step 3) -- not guessed blind.
+#
+# --- Speed pass (2026-07-20), applied after the first clean calibration measured 77.00 s/iter: ---
+#
+#   grad_checkpoint: tried true->false, REVERTED, keep true.
+#     First calibration's peak memory was 27.9 GB against a 46.7 GB limit, suggesting headroom to
+#     turn this off for a free speedup -- but a real isolation test (grad_checkpoint=false alone,
+#     everything else unchanged) reproduced garbage output: learning rate values like 6.3e+32,
+#     tokens/sec in the tens of millions, one loss value of -4.04e+30, and peak memory climbing to
+#     104 GB (real swap usage, 3 GB) -- far past both the 46.7 GB limit and the 64 GB physical
+#     machine. MLX/Metal on this hardware/mlx-lm version does NOT fail cleanly when real usage
+#     exceeds the recommended working set at this rank/layer count with checkpointing off -- it
+#     silently corrupts computation instead of erroring. grad_checkpoint=true is load-bearing here,
+#     not just insurance; do not disable it on this model/rank/machine without re-verifying.
+#
+#   max_seq_length 2048->1536: kept.
+#     Real-measured: only 23 of 77,818 examples (0.03%) exceed 1536 tokens (p99.9=1190). Isolation
+#     test (this alone, batch=4, grad_checkpoint=true) came back clean: same 27.9 GB peak memory,
+#     same loss trajectory as the original baseline, 76.03 s/iter (statistically the same as the
+#     77.00 s/iter baseline -- most real batches are far shorter than either cap, so the measured
+#     speedup was negligible in this 20-iter sample, though it should help marginally in aggregate
+#     over a full run's longer-tail batches). Safe and free to keep even without a proven win.
+#
+#   batch_size 4->8: tried, REVERTED, keep 4.
+#     Isolation test (this alone, max_seq_length=2048, grad_checkpoint=true) came back clean --
+#     no corruption, peak memory only grew to 37.1 GB, well under the limit. But per-iter time
+#     roughly doubled (162.38 s/iter) to match the doubled batch, i.e. no net wall-clock benefit:
+#     same total compute, just fewer bigger steps. Not worth the extra memory margin for zero gain.
+#
+# Pre-launch checklist:
+#   1. Run: bash scripts/preflight.sh
+#   2. Run: python scripts/train_launch.py --config config/train_config.yaml --calibrate 20
+#      (confirms the pipeline works end-to-end and reports real s/iter on this machine)
+#   3. Set `iters` below to a real value computed from that calibration, then launch for real
+#   4. Watch train/val loss together -- climbing validation loss means stop early
+
+# --- Model ---
+model: "mlx-community/Qwen3-32B-4bit"
+
+train: true
+fine_tune_type: "lora"
+
+# --- Data ---
+data: "data/sft"
+
+# --- Adapter output ---
+adapter_path: "adapters/chatpdb_32b_v1_lora"
+
+# --- LoRA / RSLoRA ---
+# rank=32, scale=64 -> effective alpha = 64/sqrt(32) = 11.31 (chem_sage's alpha-preserving formula)
+# 32 of Qwen3-32B's real 64 layers: half-depth, mirrors chem_sage's convention on a same-depth model
+num_layers: 32
+lora_parameters:
+  keys:
+    - "self_attn.q_proj"
+    - "self_attn.k_proj"
+    - "self_attn.v_proj"
+    - "self_attn.o_proj"
+    - "mlp.gate_proj"
+    - "mlp.up_proj"
+    - "mlp.down_proj"
+  rank: 32
+  scale: 64.0
+  dropout: 0.05
+
+use_rslora: true
+use_dora: false
+
+# --- Optimisation ---
+# iters=1420: real-calibrated (76-77 s/iter validated, see the speed-pass notes above) for the
+# training steps themselves -- originally targeted ~30h wall-clock (chem_sage's R5 precedent), but
+# the real total is ~38.9h once the reporting/eval rework below is included (see that section).
+# Covers ~7.3% of one epoch (~5,680 of 77,818 train examples) -- a deliberately scoped first round,
+# not a full epoch (which would take >5 days at this validated rate).
+#
+# 2026-07-22: machine crashed at true iter ~630 (last checkpoint: iter 600). Resumed via
+# `mlx_lm.lora --resume-adapter-file` -- confirmed this only reloads WEIGHTS, not the iteration
+# counter, optimizer state, or LR schedule position (real val loss at the new "iter 1" was 0.137,
+# matching the real iter-600 model; but Learning Rate logged as 0.000e+00, i.e. schedule restarted
+# from warmup) -- this is mlx_lm.lora's actual behaviour, exactly what bit chem_sage's own R3 resume
+# (see feedback_iter_offset). Following chem_sage's precedent rather than fighting the tool: iters
+# set to the REMAINING budget (820 = 1420 - 600) so total real work still matches the originally
+# approved 1420, warmup/schedule shape kept as-is (simplest, least risk of introducing an untested
+# variation). Logged iter N in this resumed run's own output = true iter (N + 600) -- apply this
+# offset in any future README/summary table, same convention as feedback_iter_offset.
+iters: 820
+batch_size: 4
+learning_rate: 2.0e-5
+
+lr_schedule:
+  name: cosine_decay
+  warmup: 100
+  arguments: [2.0e-5, 820]   # kept in sync with `iters` above
+
+weight_decay: 0.01
+
+max_seq_length: 1536
+mask_prompt: true
+grad_checkpoint: true
+seed: 51
+
+# --- Reporting / eval / checkpoints ---
+# Reworked 2026-07-20 after the first launch attempt: steps_per_report=steps_per_eval=50 (naively
+# copied from chem_sage's "align reporting" convention) silently meant the real ~48h wall-clock
+# was nearly 2x the ~30h Marc actually approved -- that lesson is about keeping a results *table*
+# readable after the fact, not about live-monitoring cost, and doesn't mean the two values need to
+# be equal. The two knobs are genuinely different costs:
+#   - steps_per_report is ~free (just prints a loss already computed during the normal step) --
+#     set to 1 for true per-iteration visibility, no real wall-clock cost either way.
+#   - steps_per_eval/val_batches drive real cost: each val pass measured at 42.58s/batch. The
+#     original val_batches=50 meant every eval cost 35.5 min; with steps_per_eval=50 that's ~30
+#     eval events across the run = ~17.7h of validation alone, on top of ~30.4h of real training.
+# steps_per_report=1, steps_per_eval=10, val_batches=5: eval every ~10 iters (~13 min) at ~3.55 min
+# per pass -- ~143 eval events, ~8.5h total validation, real total ~38.9h. Marc chose this over
+# less-frequent options for tighter early-stopping resolution, accepting the longer wall-clock.
+steps_per_report: 1
+steps_per_eval: 10
+val_batches: 5
+# save_every=100: unchanged from the original reasoning (resume-safety checkpoint cadence, distinct
+# from the eval cadence above) -- now ~14 checkpoints spread across the corrected ~38.9h run.
+save_every: 100
+
+# --- Weights & Biases (native mlx-lm 0.31.3 support, no wandb.init() wrapper needed) ---
+report_to: "wandb"
+project_name: "chatpdb"
