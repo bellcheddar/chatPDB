@@ -1,6 +1,7 @@
 flask
 flask-sock
 gunicorn
+gevent
 # chatPDB deps (subset needed for RAG fast-path + Rich CLI + real tokenizer, chat_remote.py)
 rich
 prompt_toolkit

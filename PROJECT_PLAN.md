@@ -1466,10 +1466,15 @@ simpler Gradio approach.
   `requirements.txt`, `tokenizer/` — chatPDB's real tokenizer files, ~11.5MB, bundled so the
   droplet never needs the ~18GB model weights) — ported from chem_sage's real `web/flask_app/`,
   rebranded with the teal palette from Phase 8's `chat.py`.
+- `web/flask_app/deploy/` (`chatpdb-web.service`, `nginx-chatpdb.conf`, `provision.sh`,
+  `deploy.sh`) — ported from chem_sage's real (also untested) deploy scaffolding, rebranded to
+  port 8002 (distinct from chemsage's 8001, since both may run on the same droplet) and
+  `chatpdb.mdeller.com`, with bugs 8-9 below fixed. Draft-only in this pass — not yet run against
+  the real droplet, per the plan's confirm-before-deployment boundary.
 
-**Seven real bugs found and fixed during live verification** (chem_sage's own version of this code
-had never actually been run end to end — confirmed via its uncommitted git status and
-`mdeller-landing/apps.json` still listing chemsage as `"building"`):
+**Nine real bugs found and fixed** (chem_sage's own version of this code had never actually been
+run end to end — confirmed via its uncommitted git status and `mdeller-landing/apps.json` still
+listing chemsage as `"building"`):
 1. `chat_remote.py`'s `_fake_load()` returned `tokenizer=None` — `chat.py`'s
    `tokenizer.apply_chat_template()` call would crash immediately. Fixed with a real
    `transformers.AutoTokenizer.from_pretrained()` against the bundled `tokenizer/` dir.
@@ -1501,6 +1506,22 @@ had never actually been run end to end — confirmed via its uncommitted git sta
    `.chroma/` (degrading to "Retriever unavailable" after a real ~50s timeout, not erroring
    loudly). Fixed with an explicit `os.chdir(REPO_ROOT)` in `chat_remote.py` before importing
    anything RAG-related.
+8. `web/flask_app/deploy/deploy.sh` (chem_sage's own version) **flattens** `web/flask_app/*`
+   directly into `$APP_DIR` (`/opt/chemsage/*`) — but `chat_remote.py`'s own
+   `REPO_ROOT = Path(__file__).resolve().parent.parent.parent` assumes the real three-level repo
+   nesting (`web/flask_app/chat_remote.py` → repo root). Flattened, `REPO_ROOT` resolves to `/`,
+   and `scripts/chat.py` is never found on the real droplet. Fixed: chatPDB's `deploy.sh`/
+   `provision.sh`/`chatpdb-web.service` preserve the real repo structure under `$APP_DIR`
+   (`web/flask_app/`, `scripts/chat.py`, `rag/`, `config/system_prompt.txt`) instead of flattening
+   it, so `REPO_ROOT` resolves correctly on the droplet exactly as it does locally. Also fixed the
+   real corpus-bundling gap identified above: chem_sage's `deploy.sh` only ever synced `scripts/`
+   and `rag/` (app code), never the actual `data/corpus/` (1.8GB) or `.chroma/` (9.9GB) those
+   modules read at runtime — chatPDB's version syncs both.
+9. `chatpdb-web.service`'s `ExecStart` specifies gunicorn's `-k gevent` worker class, but
+   `requirements.txt` (chem_sage's own version too) never installs the `gevent` package — gunicorn
+   would fail to start with "worker class gevent not found" on a clean droplet. Added `gevent` to
+   `requirements.txt`; confirmed live locally (`gunicorn -k gevent -w 1 -b ... wsgi:app` → real
+   HTTP 200).
 
 Also added (not a chem_sage bug, a genuine robustness gap for the hosted context specifically):
 `_remote_stream_generate()` now catches network/timeout errors and yields an informative message
