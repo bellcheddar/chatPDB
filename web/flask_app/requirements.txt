@@ -1,0 +1,11 @@
+flask
+flask-sock
+gunicorn
+# chatPDB deps (subset needed for RAG fast-path + Rich CLI + real tokenizer, chat_remote.py)
+rich
+prompt_toolkit
+pyfiglet
+pandas
+chromadb
+sentence-transformers
+transformers

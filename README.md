@@ -68,6 +68,7 @@ See **[`PROJECT_PLAN.md`](PROJECT_PLAN.md)** for the full step-by-step build (ph
 | 6 | Close the hybrid loop | `rag/tool_exec.py` (Biopython sandbox; gemmi/DSSP/PyMOL staged next) |
 | 7 | Structural evaluation | `python eval/eval_pdb.py` · `python eval/compare/eval_compare.py` |
 | 8 | Local CLI + RAG | `python scripts/chat.py` |
+| 9 | Hosted demo (in progress) | `web/hf_space/` (HF Space API) + `web/flask_app/` (droplet terminal UI) |
 
 ## ▶️ How to run
 
@@ -132,6 +133,22 @@ real Biopython blocks in the Phase 6 sandbox. No metric relies on hand-authored 
 These are small smoke-test samples (`--n 20`/`--limit 10`), run to verify the harness end to end —
 not a full evaluation pass. Run `python eval/eval_pdb.py --n 200` for a real-sized, seeded sample
 once a model server is up (see **How to run** below).
+
+## 🌐 Hosted demo (in progress)
+
+Two services, mirroring chem_sage's architecture: an HF Space (`web/hf_space/`, FastAPI +
+`llama-cpp-python`, ZeroGPU) serves the model from a Q4_K_M GGUF; a Flask app on the droplet
+(`web/flask_app/`) spawns `scripts/chat.py` in a pseudo-terminal per browser tab and streams it to
+an xterm.js terminal — the web page looks exactly like the local CLI.
+
+Real numbers from the conversion pipeline (`scripts/merge_export.py --de-quantize` → llama.cpp
+GGUF conversion → `llama-quantize`): fp16 export 61GB → Q4_K_M GGUF **18.4GB (4.82 bits/weight)**,
+sanity-checked locally (loads correctly, generates coherent real answers) before uploading to
+[`Dellboy/chatpdb_32b_v1-GGUF`](https://huggingface.co/Dellboy/chatpdb_32b_v1-GGUF).
+
+Seven real bugs were found and fixed while porting and live-testing chem_sage's own (previously
+untested) version of this architecture — full list in `PROJECT_PLAN.md` Phase 9. Actual deployment
+(HF Space creation, droplet push, `chatpdb.mdeller.com` DNS/certbot) is still pending.
 
 ## 📚 Corpus
 

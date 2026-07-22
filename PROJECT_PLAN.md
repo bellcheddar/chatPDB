@@ -1446,6 +1446,115 @@ via **Hugging Face Spaces** (Gradio `ChatInterface`, ZeroGPU hardware tier) as t
 option, with **Modal** or **Replicate** noted as fallbacks if a 32B model doesn't fit Spaces' free
 GPU tier.
 
+**Revised architecture (2026-07-22):** investigating chem_sage's own real precedent for this phase
+found it wasn't the Gradio-on-fp16 plan above, but untested, uncommitted scaffolding for a
+different, more ambitious design: an HF Space (FastAPI + `llama-cpp-python` + GGUF, ZeroGPU) as the
+GPU backend, plus a Flask app on the droplet that spawns `chat.py` in a pseudo-terminal per browser
+tab and streams it to an xterm.js terminal — the web page looks exactly like the local CLI. Marc
+chose (via `AskUserQuestion`) to mirror this fuller architecture for chatPDB rather than the
+simpler Gradio approach.
+
+**Shipped, real-verified so far (2026-07-22):**
+- `scripts/merge_export.py --de-quantize` (new flag, wraps `mlx_lm fuse`'s own native
+  `--dequantize` — confirmed live via `python -m mlx_lm fuse --help`; its own `--export-gguf`
+  flag only supports `model_type in ("llama", "mixtral", "mistral")`, not chatPDB's `qwen3`, so GGUF
+  conversion still needs a separate llama.cpp step against this fp16 output).
+- `web/hf_space/` (`app.py`, `Dockerfile`, `requirements.txt`, `README.md`) — ported from
+  chem_sage's real `web/hf_space/app.py`, rebranded, `N_CTX` corrected to chatPDB's real 1536 (not
+  chem_sage's 3072).
+- `web/flask_app/` (`app.py`, `chat_remote.py`, `templates/index.html`, `wsgi.py`,
+  `requirements.txt`, `tokenizer/` — chatPDB's real tokenizer files, ~11.5MB, bundled so the
+  droplet never needs the ~18GB model weights) — ported from chem_sage's real `web/flask_app/`,
+  rebranded with the teal palette from Phase 8's `chat.py`.
+
+**Seven real bugs found and fixed during live verification** (chem_sage's own version of this code
+had never actually been run end to end — confirmed via its uncommitted git status and
+`mdeller-landing/apps.json` still listing chemsage as `"building"`):
+1. `chat_remote.py`'s `_fake_load()` returned `tokenizer=None` — `chat.py`'s
+   `tokenizer.apply_chat_template()` call would crash immediately. Fixed with a real
+   `transformers.AutoTokenizer.from_pretrained()` against the bundled `tokenizer/` dir.
+2. The faked `mlx_lm.sample_utils` submodule was empty — `chat.py`'s own
+   `from mlx_lm.sample_utils import make_sampler, make_logits_processors` would raise
+   `ImportError` the moment `chat_loop()` started. Fixed with no-op stub functions (their return
+   values are never used by the remote generator).
+3. `spec_from_file_location("chat", str(chat_path))` loads `chat.py` under module name `"chat"`,
+   not `"__main__"` — so `chat.py`'s own `if __name__ == "__main__": main()` guard never fires and
+   the whole script silently does nothing. Fixed by loading under `"__main__"` instead.
+4. The fake `mlx`/`mlx.core` module registration (carried over "for `mx.set_wired_limit()` etc.")
+   is dead weight `chat.py` never uses, and actively breaks things: `transformers`'
+   `is_mlx_available()` feature probe calls `importlib.util.find_spec("mlx")`, which raises
+   `ValueError` on a hand-built module with `__spec__ = None`, crashing `sentence_transformers`'
+   import chain (RAG) the moment it loads. Removed entirely.
+5. Originally planned to fix the tokenizer bug via `mlx_lm.tokenizer_utils.load()` — but MLX is
+   Apple-Silicon-only and this file runs on Marc's Linux droplet, where `mlx_lm` can't even be
+   installed. Used `transformers.AutoTokenizer` instead (portable, already a dependency via
+   `sentence_transformers`).
+6. The Flask WebSocket handler wrote every incoming message straight to the PTY as keystrokes,
+   including the frontend's own `{"type": "resize", ...}` JSON control messages, which would
+   appear as literal garbage text in the terminal. Fixed: parse each message as JSON first; a real
+   resize message now applies a real `TIOCSWINSZ` ioctl instead of being written as input.
+7. `rag/corpus_lookup.py` (`CORPUS_ROOT = Path("data/corpus")`) and `rag/retrieve.py`
+   (`CHROMA_STORE = ".chroma"`) resolve these paths relative to the process's *current working
+   directory*, not the repo root — this only ever worked because testing happened to run from the
+   repo root by convention. `app.py` (living in `web/flask_app/`) spawns `chat_remote.py` without
+   setting `cwd`, so it silently found no corpus data and the RAG retriever failed to find
+   `.chroma/` (degrading to "Retriever unavailable" after a real ~50s timeout, not erroring
+   loudly). Fixed with an explicit `os.chdir(REPO_ROOT)` in `chat_remote.py` before importing
+   anything RAG-related.
+
+Also added (not a chem_sage bug, a genuine robustness gap for the hosted context specifically):
+`_remote_stream_generate()` now catches network/timeout errors and yields an informative message
+("HF Space may be cold-starting…") instead of crashing the whole PTY session — chat.py's own
+`_do_generate()` has no error handling around its `stream_generate()` call, which is fine for a
+local in-process model but would kill every browser session on any real network blip or ZeroGPU
+cold start in the hosted context.
+
+Live-verified end to end through the **real** Flask + WebSocket + PTY + subprocess stack (not just
+direct function calls): a real browser-side WebSocket client connected, sent a resize + a real PDB
+ID query, and received the real corpus-lookup panel back through the full pipeline after the
+retriever's real ~60s cold-load, byte-for-byte identical to running `chat.py` locally.
+
+**GGUF pipeline: run for real (2026-07-22), real results:**
+- `merge_export.py --de-quantize` → 61GB real fp16 HF-format safetensors, confirmed standard
+  `transformers`-style tensor names (`model.layers.N.mlp.down_proj.weight`, etc.) — completed fast
+  (well under a minute).
+- First attempt used llama.cpp's `--outtype q8_0` direct conversion (skip the fp16-GGUF
+  intermediate, sized to fit the disk budget) — conversion itself succeeded (34.8GB q8_0 GGUF,
+  ~5m42s), but `llama-quantize` **refused to requantize from q8_0 to Q4_K_M**
+  (`llama_model_quantize: failed to quantize: requantizing from type q8_0 is disabled`) — a real
+  llama.cpp safety check against compounding lossy quantization. Redid the conversion with
+  `--outtype f16` instead (65.5GB, ~1m47s) once disk headroom was confirmed healthy again, then
+  quantized that single-generation f16 → Q4_K_M — the correct, non-compounding path.
+- Real `llama-quantize` output: **18,840.96 MiB (~18.4GB) at 4.82 bits/weight** (down from 16.00
+  BPW at f16), quantize time 252.4s (~4.2 min).
+- **Sanity-checked the real Q4_K_M file**: installed `llama-cpp-python` locally (CPU-only, this Mac
+  has no CUDA — fine, only checking the file loads and generates coherently, not benchmarking
+  speed), loaded `chatpdb_32b_v1_q4km.gguf`, and generated against a real prompt ("What is a
+  Ramachandran plot used for?") — produced a correct, coherent, on-topic real answer (dihedral
+  angle distribution, allowed/disallowed regions, secondary structure/fold quality), confirming the
+  file isn't corrupted and the conversion+quantization pipeline produced a genuinely working model.
+- Uploaded to `Dellboy/chatpdb_32b_v1-GGUF` (`env -u HF_TOKEN hf upload`, per
+  [[feedback_hf_upload]]) — confirmed real network transfer via `nettop`/`lsof` (active TCP
+  connections to HF's S3-backed storage, real bytes in flight).
+- Real disk-margin lesson from this pass: macOS/APFS space-accounting after a large `rm -rf` has a
+  real reporting delay (freed space didn't show in `df -h` immediately after deleting the 61GB fp16
+  dir, then jumped from 86GB free to 147GB free on a later check with no other change) — don't
+  trust a single `df -h` reading right after a large deletion when margin is tight; re-check.
+
+**Real, still-open items before deployment:**
+- **Droplet needs real corpus data bundled, not just app code.** `rag/corpus_lookup.py`'s fast-path
+  needs `data/corpus/` (1.8GB, confirmed via `du -sh`) and `rag/retrieve.py`'s RAG needs `.chroma/`
+  (9.9GB) present on the droplet — neither is part of the app code itself. `data/structures_all/`
+  (353GB, used by `rag/tool_exec.py`'s Biopython execution) is **not** feasible to bundle on a
+  3.8GB-RAM droplet — the hosted demo will not have working tool-exec; a Biopython code block the
+  model emits will fail to find its referenced `.cif` file rather than execute against real data.
+  This is a real, accepted scope reduction for the hosted demo, not a bug.
+- Actual deployment (create the real HF Space and push the GGUF+app, push the Flask app to the
+  droplet, provision `chatpdb.mdeller.com` nginx/certbot, `mdeller-landing` entry) — per the plan,
+  held for explicit confirmation before each step since these touch shared, externally-visible
+  infrastructure. The GGUF itself is now uploaded (see above); creating the actual Space that
+  serves it is a separate, still-pending step.
+
 ### Phase 10 — Iterate (ongoing)
 Same design-build-test-learn loop as chem_sage: eval failures become new Phase 3 training examples;
 new PDB releases and OpenBind updates get ingested into RAG continuously; re-tune only for genuine
