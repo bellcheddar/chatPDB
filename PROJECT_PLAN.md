@@ -1570,11 +1570,88 @@ retriever's real ~60s cold-load, byte-for-byte identical to running `chat.py` lo
   3.8GB-RAM droplet — the hosted demo will not have working tool-exec; a Biopython code block the
   model emits will fail to find its referenced `.cif` file rather than execute against real data.
   This is a real, accepted scope reduction for the hosted demo, not a bug.
-- Actual deployment (create the real HF Space and push the GGUF+app, push the Flask app to the
-  droplet, provision `chatpdb.mdeller.com` nginx/certbot, `mdeller-landing` entry) — per the plan,
-  held for explicit confirmation before each step since these touch shared, externally-visible
-  infrastructure. The GGUF itself is now uploaded (see above); creating the actual Space that
-  serves it is a separate, still-pending step.
+**HF Space created and live-verified end to end (2026-07-23).** `Dellboy/chatpdb-api` was created
+(Gradio SDK) and given ZeroGPU hardware, with three more real bugs found and fixed on top of the
+nine above — none of these were guessable in advance; each was diagnosed from real evidence
+(`fetch_space_logs`, live curl, `get_space_runtime`), not assumed:
+
+10. **Docker SDK is incompatible with ZeroGPU.** Requesting ZeroGPU hardware for the originally
+    Docker-SDK Space (`FastAPI` + custom `Dockerfile`, matching chem_sage's own layout) failed with
+    a real `400 Bad Request: "ZeroGPU Spaces only work with Gradio SDK"`. Fixed by switching to the
+    Gradio SDK and deleting the `Dockerfile` entirely.
+11. **A custom FastAPI route doesn't survive Gradio's own catch-all, and ZeroGPU's detection
+    requires `demo.launch()` as the real entrypoint — these two constraints conflict.** First
+    attempt added `@demo.app.post("/generate")` (Gradio SDK, matching chem_sage's own already-fixed
+    pattern) — the Space built and ran, but a live `curl -I -X POST` got `405 Method Not Allowed`
+    (`allow: GET`), confirming Gradio's own SPA catch-all route silently claims the path first.
+    Second attempt used `gr.mount_gradio_app()` (a plain FastAPI app owns real routing, Gradio
+    mounted as a sub-app) — this genuinely fixed routing (verified locally via
+    `demo.config['dependencies']`), but broke ZeroGPU entirely: real `RUNTIME_ERROR`,
+    `"No @spaces.GPU function detected during startup"`. Web research (HF forum threads on this
+    exact error) confirmed ZeroGPU's startup scan for `@spaces.GPU`-decorated functions requires
+    `demo.launch()` to be the actual serving entrypoint — a custom-FastAPI-primary architecture
+    isn't supported regardless of whether `spaces.GPU` is imported/used. **Real, working fix:**
+    restore `demo.launch()` as the entrypoint, and expose `/generate` via Gradio's own native REST
+    API mechanism instead of any custom route — a hidden `gr.Row(visible=False)` with a
+    `.click(..., api_name="generate")` binding, which Gradio auto-exposes as
+    `POST /gradio_api/call/generate` (returns `{"event_id": ...}`) +
+    `GET /gradio_api/call/generate/<event_id>` (SSE: `heartbeat` → `complete`/`error`). Note the
+    real URL prefix is `/gradio_api/call/`, not the bare `/call/` shown in some older Gradio docs —
+    confirmed live (bare path returns 405).
+12. **`llama-cpp-python`'s CUDA wheel couldn't find its own CUDA runtime on the ZeroGPU worker**:
+    real traceback (via `fetch_space_logs`, not guessed) — `OSError: libcudart.so.12: cannot open
+    shared object file`, from `llama_cpp`'s own `ctypes.CDLL()` call in `_ctypes_extensions.py`.
+    Fixed by adding `nvidia-cuda-runtime-cu12`/`nvidia-cublas-cu12` to `requirements.txt` and
+    pre-loading their bundled `.so` files via `ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)` — scanned
+    generically across every installed `nvidia.*` pip package via `pkgutil.iter_modules` rather than
+    hardcoding library names — before `llama_cpp` is imported (pattern confirmed via
+    `github.com/abetlen/llama-cpp-python#1460`).
+13. **The 19.8GB GGUF download originally ran *inside* the `@spaces.GPU`-decorated function**,
+    competing with generation for the same bounded GPU lease. After bug 12's fix, the Space reached
+    `RUNNING` with no error, but a live end-to-end curl test timed out after 200s having received
+    only `heartbeat` events. Real Space logs showed why: the download was still in progress (81%,
+    16.0GB/19.8GB, at a real ~50-65MB/s) at 5m24s wall-clock — well past the
+    `@spaces.GPU(duration=180)` cap — with no further log lines ever written afterward, meaning the
+    GPU lease was silently reclaimed mid-download. Root cause: `_get_model_path()`
+    (`hf_hub_download`) was called from inside the GPU-decorated function, so a plain network
+    transfer was burning GPU-lease seconds it didn't need. Fixed by triggering the download eagerly
+    at module-import time (once, at container boot, cached to the Space's persistent container
+    disk) — outside the GPU lease entirely — so the leased function only has to load the
+    already-local GGUF and generate.
+
+**Real end-to-end confirmation (2026-07-23):** after fix 13, a fresh POST →
+`GET .../gradio_api/call/generate/<event_id>` round-trip resolved in ~2 heartbeats (well under a
+minute) with a real `complete` event carrying coherent, on-topic generated text for a real prompt
+("What is the PDB?" → a correct definition of the Protein Data Bank). The full protocol — Gradio's
+native `api_name="generate"` mechanism, ZeroGPU hardware, the CUDA-library preload, the boot-time
+download — is confirmed genuinely working, not just believed to work.
+
+`web/flask_app/chat_remote.py`'s `_remote_stream_generate()` was updated to match the real,
+confirmed protocol (`/gradio_api/call/generate`, not the originally-assumed bare `/call/generate`).
+
+GGUF upload itself (`Dellboy/chatpdb_32b_v1-GGUF`, 19.8GB) took **~9h48m** real wall-clock — not
+because of a fixed bug, but because of real network conditions on this pass: the default Xet
+chunked-upload backend genuinely deadlocked after ~30min (confirmed via `sample <pid>` showing a
+thread frozen on `_pthread_cond_wait` with zero CPU progress), and the retried standard-upload path
+(`HF_HUB_DISABLE_XET=1`) crashed after 8.5h on a real AWS S3 idle-connection timeout (`hf upload`
+CLI's default 5 concurrent threads spread limited real bandwidth too thin per connection) before
+finally succeeding on a third attempt using `HfApi().preupload_lfs_files(..., num_threads=1)`
+directly. This was upload-bandwidth-bound, not a code bug — flagged here for the record, not as a
+recommendation to change the code.
+
+**Real, still-open items before full deployment:**
+- **Droplet needs real corpus data bundled, not just app code.** `rag/corpus_lookup.py`'s fast-path
+  needs `data/corpus/` (1.8GB, confirmed via `du -sh`) and `rag/retrieve.py`'s RAG needs `.chroma/`
+  (9.9GB) present on the droplet — neither is part of the app code itself. `data/structures_all/`
+  (353GB, used by `rag/tool_exec.py`'s Biopython execution) is **not** feasible to bundle on a
+  3.8GB-RAM droplet — the hosted demo will not have working tool-exec; a Biopython code block the
+  model emits will fail to find its referenced `.cif` file rather than execute against real data.
+  This is a real, accepted scope reduction for the hosted demo, not a bug.
+- The HF Space backend (`Dellboy/chatpdb-api`) is live and confirmed working. Still pending, held
+  for explicit confirmation before each step since these touch shared, externally-visible
+  infrastructure: push `web/flask_app/` to the real droplet via `deploy.sh`, run `provision.sh`
+  (nginx vhost + certbot for `chatpdb.mdeller.com`), start the systemd service, confirm a real
+  browser session end to end, then add the `mdeller-landing` entry.
 
 ### Phase 10 — Iterate (ongoing)
 Same design-build-test-learn loop as chem_sage: eval failures become new Phase 3 training examples;

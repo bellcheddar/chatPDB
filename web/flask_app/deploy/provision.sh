@@ -44,15 +44,18 @@ fi
 sudo -u "$APP_USER" "$FLASK_DIR/.venv/bin/pip" install --quiet --upgrade pip
 sudo -u "$APP_USER" "$FLASK_DIR/.venv/bin/pip" install --quiet -r "$FLASK_DIR/requirements.txt"
 
-echo "==> Creating .env (HF Space URL)"
+echo "==> Creating .env (HF Space URL + token)"
 if [[ ! -f "$FLASK_DIR/.env" ]]; then
   cat > "$FLASK_DIR/.env" <<'EOF'
 HF_SPACE_URL=https://dellboy-chatpdb-api.hf.space
+HF_TOKEN=change-me
 SECRET_KEY=change-me
 EOF
   chown "$APP_USER:$APP_USER" "$FLASK_DIR/.env"
   chmod 600 "$FLASK_DIR/.env"
-  echo "    Created $FLASK_DIR/.env — edit SECRET_KEY before going live."
+  echo "    Created $FLASK_DIR/.env — edit HF_TOKEN and SECRET_KEY before going live."
+  echo "    (HF_TOKEN is required: ZeroGPU's anonymous quota is ~85s/day and requests without"
+  echo "    a Bearer token silently start failing after a handful of calls.)"
 fi
 
 echo "==> Installing systemd unit"

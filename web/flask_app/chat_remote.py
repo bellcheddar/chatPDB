@@ -39,6 +39,11 @@ sys.path.insert(0, str(REPO_ROOT))
 os.chdir(REPO_ROOT)
 
 HF_SPACE_URL = os.environ.get("HF_SPACE_URL", "").rstrip("/")
+# Real lesson carried over from chem_sage's own deployment (web/DEPLOYMENT_LESSONS.md #1):
+# ZeroGPU's anonymous daily quota is tiny (~85s GPU-time) -- without a Bearer token, requests start
+# silently failing (SSE "event: error") after a handful of calls, which looks identical to a
+# working-but-empty response unless the error event is explicitly checked for (see below).
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 TOKENIZER_DIR = Path(__file__).resolve().parent / "tokenizer"
 
 # ---------------------------------------------------------------------------
@@ -47,7 +52,31 @@ TOKENIZER_DIR = Path(__file__).resolve().parent / "tokenizer"
 
 def _remote_stream_generate(model, tokenizer, *, prompt: str, max_tokens: int = 512,
                              sampler=None, logits_processors=None, **kwargs):
-    """Yield text chunks from the HF Space streaming endpoint.
+    """Yield text chunks from the HF Space, via Gradio's own native API protocol.
+
+    Real fix (found + fixed 2026-07-23): a hand-rolled custom `/generate` FastAPI route does not
+    reliably work on ZeroGPU Spaces -- confirmed live that ZeroGPU's startup detection of
+    @spaces.GPU functions requires Gradio's own demo.launch() to be the actual serving entrypoint,
+    which rules out a custom-FastAPI-primary architecture entirely (a `gr.mount_gradio_app()`
+    attempt made routing work but broke ZeroGPU detection: "No @spaces.GPU function detected during
+    startup"). The Space now exposes the function via Gradio's own auto-generated REST API instead
+    (api_name="generate" on a real Blocks event). Real protocol, confirmed via LIVE curl testing
+    against the deployed Space (Gradio 6.20.0) -- note the real prefix is `/gradio_api/call/`, NOT
+    the bare `/call/` shown in some older Gradio docs pages (confirmed: bare path returns 405):
+        POST {HF_SPACE_URL}/gradio_api/call/generate
+          {"data": [prompt, max_tokens, temperature, repeat_penalty]} -> {"event_id": "..."}
+        GET  {HF_SPACE_URL}/gradio_api/call/generate/<event_id>  (SSE: "event: complete\\ndata: [\"<text>\"]")
+
+    Real fix (found + fixed 2026-07-23, second bug): the GGUF download originally ran *inside* the
+    @spaces.GPU-decorated function, so it competed with generation for the same bounded GPU lease
+    -- confirmed via real Space logs showing the download still in progress (81%, 5m24s wall clock)
+    well past the lease's duration cap, with the lease then silently reclaimed (no further log
+    lines, no complete/error event ever delivered). Fixed on the Space side by downloading eagerly
+    at container-boot / module-import time, outside the GPU lease entirely -- this file's protocol
+    is unaffected, but a real request should now resolve in well under this function's own timeouts.
+    The Space returns the full generated text as one string (not per-token, per the ZeroGPU
+    bounded-lease constraint noted in app.py), so this yields one chunk rather than many -- fine
+    functionally, since chat.py's own display loop just accumulates whatever chunks arrive.
 
     Wraps the whole request in try/except: chat.py's own _do_generate() has no error handling
     around its stream_generate() call, so an uncaught exception here (HF Space cold-start,
@@ -65,35 +94,49 @@ def _remote_stream_generate(model, tokenizer, *, prompt: str, max_tokens: int = 
         )
         return
 
-    body = json.dumps({
-        "prompt": prompt,
-        "max_tokens": max_tokens,
-        "temperature": 0.15,
-        "repeat_penalty": 1.15,
-    }).encode()
-    req = urllib.request.Request(
-        f"{HF_SPACE_URL}/generate",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    auth_headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        # -- Step 1: POST to submit the job, get an event_id --
+        body = json.dumps({"data": [prompt, max_tokens, 0.15, 1.15]}).encode()
+        post_req = urllib.request.Request(
+            f"{HF_SPACE_URL}/gradio_api/call/generate",
+            data=body,
+            headers={"Content-Type": "application/json", **auth_headers},
+            method="POST",
+        )
+        with urllib.request.urlopen(post_req, timeout=30) as resp:
+            event_id = json.loads(resp.read().decode("utf-8"))["event_id"]
+
+        # -- Step 2: GET the SSE stream for that event_id, wait for "complete" --
+        get_req = urllib.request.Request(
+            f"{HF_SPACE_URL}/gradio_api/call/generate/{event_id}",
+            headers=auth_headers,
+            method="GET",
+        )
+        with urllib.request.urlopen(get_req, timeout=180) as resp:
+            current_event = None
             for raw_line in resp:
                 line = raw_line.decode("utf-8").strip()
+                if line.startswith("event:"):
+                    current_event = line[len("event:"):].strip()
+                    continue
                 if not line.startswith("data:"):
                     continue
-                payload = line[5:].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    token = json.loads(payload).get("token", "")
-                except json.JSONDecodeError:
-                    continue
-                if token:
-                    # Yield a fake chunk object that chat.py expects
-                    yield types.SimpleNamespace(text=token)
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                payload = line[len("data:"):].strip()
+                if current_event == "error":
+                    yield types.SimpleNamespace(text=f"[chatPDB backend error: {payload}]")
+                    return
+                if current_event == "complete":
+                    try:
+                        result = json.loads(payload)
+                        text = result[0] if isinstance(result, list) and result else ""
+                    except (json.JSONDecodeError, IndexError, TypeError):
+                        text = ""
+                    if text:
+                        yield types.SimpleNamespace(text=text)
+                    return
+    except (urllib.error.URLError, TimeoutError, OSError, KeyError, json.JSONDecodeError) as exc:
         yield types.SimpleNamespace(
             text=f"[chatPDB backend unreachable: {exc}. The HF Space may be cold-starting "
                  f"(can take 1-2 min) or temporarily down -- try again shortly.]"
