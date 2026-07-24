@@ -69,7 +69,7 @@ See **[`PROJECT_PLAN.md`](PROJECT_PLAN.md)** for the full step-by-step build (ph
 | 6 | Close the hybrid loop | `rag/tool_exec.py` (Biopython sandbox; gemmi/DSSP/PyMOL staged next) |
 | 7 | Structural evaluation | `python eval/eval_pdb.py` · `python eval/compare/eval_compare.py` |
 | 8 | Local CLI + RAG | `python scripts/chat.py` |
-| 9 | Hosted demo (API live, droplet pending) | `web/hf_space/` (HF Space API, live) + `web/flask_app/` (droplet terminal UI, pending deploy) |
+| 9 | Hosted demo (**live**) | `web/hf_space/` (HF Space API) + `web/flask_app/` (droplet terminal UI) — [chatpdb.mdeller.com](https://chatpdb.mdeller.com) |
 
 ## ▶️ How to run
 
@@ -135,7 +135,9 @@ These are small smoke-test samples (`--n 20`/`--limit 10`), run to verify the ha
 not a full evaluation pass. Run `python eval/eval_pdb.py --n 200` for a real-sized, seeded sample
 once a model server is up (see **How to run** below).
 
-## 🌐 Hosted demo
+## 🌐 Hosted demo — **live**
+
+**[chatpdb.mdeller.com](https://chatpdb.mdeller.com)** — try it in your browser, no setup needed.
 
 Two services, mirroring chem_sage's architecture: an HF Space
 ([`Dellboy/chatpdb-api`](https://huggingface.co/spaces/Dellboy/chatpdb-api), Gradio SDK +
@@ -148,19 +150,18 @@ GGUF conversion → `llama-quantize`): fp16 export 61GB → Q4_K_M GGUF **18.4GB
 sanity-checked locally (loads correctly, generates coherent real answers) before uploading to
 [`Dellboy/chatpdb_32b_v1-GGUF`](https://huggingface.co/Dellboy/chatpdb_32b_v1-GGUF).
 
-The HF Space backend is **live and confirmed working end to end** — real POST → SSE round-trip
-against ZeroGPU hardware returning coherent generated text. Thirteen real bugs were found and fixed
-while porting and live-testing chem_sage's own (previously untested) version of this architecture,
-including three ZeroGPU-specific ones only findable by live deployment: Docker SDK is incompatible
-with ZeroGPU hardware; a custom FastAPI route silently loses to Gradio's own catch-all route, but
-ZeroGPU's startup detection requires `demo.launch()` as the real entrypoint — solved by exposing the
-endpoint through Gradio's own native `api_name="generate"` REST mechanism instead; and the model
-download must happen at container boot, not inside the `@spaces.GPU`-decorated function, or it burns
-the bounded GPU lease on a plain network transfer. Full list in `PROJECT_PLAN.md` Phase 9.
+**Confirmed working end to end** via a real WebSocket client: the terminal boots `chat.py`, loads
+the real corpus (105,463 chunks) and RAG retriever, and a real query triggers retrieval plus a real
+remote generation through the HF Space (ZeroGPU) — coherent answer, 105 tokens in 66.8s cold.
 
-Still pending, held for explicit confirmation before each step (shared, externally-visible
-infrastructure): push `web/flask_app/` to the droplet, provision `chatpdb.mdeller.com`
-nginx/certbot, add the `mdeller-landing` entry.
+Thirteen real bugs were found and fixed while porting and live-testing chem_sage's own (previously
+untested) version of this architecture, including four ZeroGPU-specific ones only findable by live
+deployment: Docker SDK is incompatible with ZeroGPU hardware; a custom FastAPI route silently loses
+to Gradio's own catch-all route, but ZeroGPU's startup detection requires `demo.launch()` as the
+real entrypoint — solved by exposing the endpoint through Gradio's own native `api_name="generate"`
+REST mechanism instead; a CUDA-built wheel couldn't find its own bundled CUDA libs at runtime; and
+the model download must happen at container boot, not inside the `@spaces.GPU`-decorated function,
+or it burns the bounded GPU lease on a plain network transfer. Full list in `PROJECT_PLAN.md` Phase 9.
 
 ## 📚 Corpus
 

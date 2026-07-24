@@ -78,5 +78,27 @@ else
     echo "    certbot failed (DNS not pointed yet?). Re-run: certbot --nginx -d ${SERVER_NAME}"
 fi
 
+# Certbot's `listen 443 ssl;` lines don't enable HTTP/2 on nginx 1.24 -- add it ourselves,
+# idempotently, so this also fixes an already-provisioned site on a re-run. nginx's http2 option
+# is per listen address:port, shared across every vhost on that socket -- skipping this on a new
+# subdomain can destabilize the others already sharing port 443 (see
+# project_droplet_nginx_perf memory / mdeller.com's own 2026-07-22/23 audit).
+if grep -q "listen.*443 ssl" /etc/nginx/sites-available/chatpdb 2>/dev/null && \
+   ! grep -q "listen.*443 ssl http2" /etc/nginx/sites-available/chatpdb; then
+  echo "==> Enabling HTTP/2"
+  python3 - <<'PYEOF'
+import re
+p = "/etc/nginx/sites-available/chatpdb"
+text = open(p).read()
+text = re.sub(
+    r'listen ((?:\[::\]:)?443) ssl( ipv6only=on)?;',
+    lambda m: f'listen {m.group(1)} ssl http2{m.group(2) or ""};',
+    text,
+)
+open(p, "w").write(text)
+PYEOF
+  nginx -t && systemctl reload nginx
+fi
+
 echo "==> Done."
 systemctl --no-pager --lines=5 status chatpdb-web.service || true

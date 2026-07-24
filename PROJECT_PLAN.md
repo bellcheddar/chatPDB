@@ -1647,11 +1647,26 @@ recommendation to change the code.
   3.8GB-RAM droplet — the hosted demo will not have working tool-exec; a Biopython code block the
   model emits will fail to find its referenced `.cif` file rather than execute against real data.
   This is a real, accepted scope reduction for the hosted demo, not a bug.
-- The HF Space backend (`Dellboy/chatpdb-api`) is live and confirmed working. Still pending, held
-  for explicit confirmation before each step since these touch shared, externally-visible
-  infrastructure: push `web/flask_app/` to the real droplet via `deploy.sh`, run `provision.sh`
-  (nginx vhost + certbot for `chatpdb.mdeller.com`), start the systemd service, confirm a real
-  browser session end to end, then add the `mdeller-landing` entry.
+**Full deployment complete and live-verified (2026-07-24).** `deploy.sh` synced code + `data/corpus/`
+(1.8GB) + `.chroma/` (9.9GB) to the droplet (~9.9GB `.chroma` sync took ~85 min over rsync's
+many-small-files overhead — real, not stuck, confirmed via steady growth checks every 25-30 min).
+One real gap found and fixed: `deploy.sh` deliberately excludes `deploy/` from the app-code rsync
+(scripts don't belong in the runtime dir), which meant `provision.sh` itself was never on the
+droplet on a first-ever deploy — pushed the `deploy/` directory separately before running it.
+`provision.sh` ran clean: venv, systemd unit, nginx site, and a real certbot-issued TLS cert for
+`chatpdb.mdeller.com` (DNS was already pointed). Also applied the HTTP/2 post-certbot patch from
+[[project_droplet_nginx_perf]] (nginx 1.24's `http2` option is per listen-socket, shared across every
+vhost on port 443 — a new subdomain skipping it can destabilize `chemsage`/`alphafraud`/`mdeller.com`
+already sharing that port) — this wasn't in the original script and was added before provisioning,
+not after. Real `.env` secrets (`HF_TOKEN`, `SECRET_KEY`) were generated and set, replacing the
+`change-me` placeholders, before first real use (`HF_TOKEN` is required — see bug 13's fix and
+`web/DEPLOYMENT_LESSONS.md` #1: ZeroGPU's anonymous quota is ~85s/day).
+
+Live-verified end to end via a real WebSocket client (not just curl): PTY boots `chat.py`'s real
+banner, loads the real corpus (105,463 chunks) and RAG retriever, a real query triggers retrieval (5
+chunks) and a real remote generation via the HF Space, returning a correct, coherent answer (105
+tokens, 1.6 tok/s, 66.8s for the cold request). `mdeller-landing/apps.json`'s `chatpdb` entry flipped
+from `"building"` to `"live"`, confirmed showing "up" on the real health-checked launcher page.
 
 ### Phase 10 — Iterate (ongoing)
 Same design-build-test-learn loop as chem_sage: eval failures become new Phase 3 training examples;
