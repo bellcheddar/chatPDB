@@ -38,3 +38,9 @@ venv/
 
 # OS
 .DS_Store
+
+# README forge outputs (regenerate locally with readme_forge.py)
+*.polished.md
+README.html
+README.preview.html
+elementor-widget-markdown.css

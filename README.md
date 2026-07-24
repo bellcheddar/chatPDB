@@ -2,11 +2,11 @@
 
 > **A protein-structure-literate AI assistant for the Protein Data Bank: RAG for facts, a QLoRA-tuned model for behaviour, and live Biopython/gemmi/DSSP/PyMOL tool calls for structural truth. Fine-tuned and served locally on Apple Silicon with MLX-LM.**
 
-![MLX-LM](https://img.shields.io/badge/MLX--LM-Apple%20Silicon-000000?logo=apple&logoColor=white) ![fine-tune](https://img.shields.io/badge/fine--tune-QLoRA-467FF7) ![base](https://img.shields.io/badge/base-Qwen3--32B-00897B) ![RAG](https://img.shields.io/badge/RAG-ChromaDB%20+%2042%20sources-9b51e0) ![models](https://img.shields.io/badge/models-Hugging%20Face-FFD21E?logo=huggingface&logoColor=black) ![author](https://img.shields.io/badge/author-Marc%20C.%20Deller%2C%20D.Phil.-1C244B)
+[![live](https://img.shields.io/badge/live-chatpdb.mdeller.com-00d084)](https://chatpdb.mdeller.com) ![MLX-LM](https://img.shields.io/badge/MLX--LM-Apple%20Silicon-000000?logo=apple&logoColor=white) ![fine-tune](https://img.shields.io/badge/fine--tune-QLoRA-467FF7) ![base](https://img.shields.io/badge/base-Qwen3--32B-00897B) ![RAG](https://img.shields.io/badge/RAG-ChromaDB%20+%2042%20sources-9b51e0) ![models](https://img.shields.io/badge/models-Hugging%20Face-FFD21E?logo=huggingface&logoColor=black) ![author](https://img.shields.io/badge/author-Marc%20C.%20Deller%2C%20D.Phil.-1C244B)
 
 <table>
 <tr>
-<td>🌐 <b>Website</b></td><td><a href="https://marcdeller.com" target="_blank" rel="noopener noreferrer">marcdeller.com</a></td>
+<td>🌐 <b>Website</b></td><td><a href="https://chatpdb.mdeller.com" target="_blank" rel="noopener noreferrer">chatpdb.mdeller.com</a></td>
 <td>✉️ <b>Contact</b></td><td><a href="mailto:marc@marcdeller.com">marc@marcdeller.com</a></td>
 <td>🐙 <b>GitHub</b></td><td><a href="https://github.com/bellcheddar/chatPDB" target="_blank" rel="noopener noreferrer">bellcheddar/chatPDB</a></td>
 </tr>
@@ -29,7 +29,9 @@ sandbox, rather than asserted from memory. It is useful for: interrogating depos
 and their cross-references, generating correct Biopython/gemmi/DSSP/PyMOL scripts, honestly
 declining to answer when an ID doesn't exist or a value isn't known, and reasoning like a
 structural biologist about experimental method, quality, and biological assembly rather than
-treating a structure as a bare coordinate file.
+treating a structure as a bare coordinate file. A live, no-install terminal session against
+the real fine-tuned model runs at **[chatpdb.mdeller.com](https://chatpdb.mdeller.com)** (see
+**Web deployment** below).
 
 Sibling project to [ChemSage](https://github.com/bellcheddar/ChemSage), reusing its proven
 MLX-LM/QLoRA/RAG process on a fresh domain: protein structures instead of small-molecule chemistry.
@@ -68,6 +70,7 @@ See **[`PROJECT_PLAN.md`](PROJECT_PLAN.md)** for the full step-by-step build (ph
 | 6 | Close the hybrid loop | `rag/tool_exec.py` (Biopython sandbox; gemmi/DSSP/PyMOL staged next) |
 | 7 | Structural evaluation | `python eval/eval_pdb.py` · `python eval/compare/eval_compare.py` |
 | 8 | Local CLI + RAG | `python scripts/chat.py` |
+| 9 | Hosted demo (no local install) | live at [chatpdb.mdeller.com](https://chatpdb.mdeller.com), see **Web deployment** below |
 
 ## ▶️ How to run
 
@@ -142,6 +145,30 @@ records, BindingDB affinities, STRING interactions, Pharos druggability, AlphaFo
 AlphaFraud PDB-vs-AlphaFold disagreement data, PubMed/CrossRef citation verification, and full
 PyMOL/ChimeraX/py3Dmol command references — see [`data/README.md`](data/README.md) for the
 complete dataset-version history and construction rules.
+
+## 🌐 Web deployment
+
+**Live at [chatpdb.mdeller.com](https://chatpdb.mdeller.com).** Not a rebuilt chat-bubble
+interface: the browser gets a real terminal (xterm.js) connected over WebSocket to a
+server-side PTY running the actual, unmodified `scripts/chat.py` — the same Rich-rendered
+markdown, corpus retrieval, and slash commands as running it locally.
+
+**No GPU on the droplet.** `chat_remote.py` (sibling to [ChemSage](https://github.com/bellcheddar/ChemSage)'s
+own, reusing the same pattern) is a drop-in launcher: at import time it patches
+`mlx_lm.generate`/`mlx_lm.stream_generate` to call a HuggingFace Space running the real fused
+32B model on ZeroGPU (a serverless, on-demand GPU allocation), then runs `chat.py` completely
+unaware anything is different.
+
+**Serving stack:** gunicorn with a single `gevent` worker (100 concurrent connections) rather
+than `sync` workers — a terminal session is I/O-bound (waiting on the remote model and on
+keystrokes), not CPU-bound, so one greenlet-based worker serves many concurrent sessions
+cheaply. nginx reverse-proxies both the WebSocket endpoint (`/ws`, with `Upgrade`/`Connection`
+headers and a long read/send timeout for idle-but-open sessions) and the static app shell,
+behind a Let's Encrypt certificate. Runs as a dedicated systemd service on the droplet
+alongside ChemSage and BoltzMaker's own web apps.
+
+**Source isolation:** the web app (`web/flask_app/`) lives on a separate `chatpdb-web` git
+branch/worktree, so it never touches the tested training/eval code on `main`.
 
 ## 🧱 Stack
 
