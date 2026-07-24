@@ -1,7 +1,0 @@
---extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
-llama-cpp-python
-nvidia-cuda-runtime-cu12
-nvidia-cublas-cu12
-gradio>=4.0
-spaces
-huggingface_hub
